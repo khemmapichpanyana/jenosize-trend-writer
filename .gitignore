@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Secrets & local state
+.env
+.env.*
+!.env.example
+.data/            # local storage backend writes here
+.vercel/
+.modal/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

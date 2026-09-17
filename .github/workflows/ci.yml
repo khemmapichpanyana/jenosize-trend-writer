@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --group dev --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest
+
+      # The whole point of the mock provider: CI proves the service generates an
+      # article end to end without a GPU, a database or an object store.
+      - name: Smoke test (mock provider)
+        env:
+          MODEL_PROVIDER: mock
+          PERSISTENCE: none
+          STORAGE: local
+        run: |
+          uv run uvicorn app.main:app --port 8000 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8000/api/v1/health >/dev/null && break
+            sleep 1
+          done
+          ./scripts/smoke_test.sh http://localhost:8000
+
+      - name: Check the Vercel bundle stays light
+        run: |
+          if grep -Eiq '^(torch|transformers|unsloth|trl|vllm|bitsandbytes)([=<>~[]|$)' requirements.txt; then
+            echo "::error::heavy ML dependency leaked into requirements.txt (Vercel 500 MB limit)"
+            exit 1
+          fi

@@ -1,0 +1,89 @@
+[project]
+name = "jenosize-trend-writer"
+version = "0.1.0"
+description = "AI service that generates Jenosize-style business trend articles (FastAPI + fine-tuned LLM + retrieval)."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+# Runtime dependencies only. These are what Vercel installs.
+# HARD RULE: no torch / transformers / unsloth / trl / vllm / bitsandbytes here.
+# All heavy ML deps live exclusively inside the Modal image definitions (modal/common.py),
+# because the Vercel Python bundle is capped at 500 MB.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "httpx>=0.27.0",
+    "openai>=1.54.0",           # async OpenAI-compatible client (points at Modal vLLM in prod)
+    "anyio>=4.6.0",             # to_thread wrappers for the sync supabase/boto3 SDKs
+    "python-multipart>=0.0.12", # multipart/form-data for POST /sources/upload
+    "supabase>=2.9.0",
+    "boto3>=1.35.0",            # Cloudflare R2 is S3-compatible
+    "trafilatura>=1.12.0",      # URL -> main article text
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
+    "typer>=0.12.5",            # pipeline CLIs
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "respx>=0.21.1",
+    "types-boto3>=1.35.0",
+]
+# Offline data-engineering extras that are NOT needed by the API at runtime.
+pipeline = [
+    "beautifulsoup4>=4.12.3",
+    "lxml>=5.3.0",
+    "tqdm>=4.66.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# `modal/` shadows the installed `modal` package when the repo root is on sys.path,
+# so it is linted as a standalone script tree, never imported by the app.
+extend-exclude = [".data", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "C4", "SIM", "RUF"]
+ignore = [
+    "B008",  # FastAPI's Depends()/File() defaults are the documented idiom
+    "E501",  # long lines are handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "pipeline", "tests"]
+# Non-strict on purpose: this is a Day-0 skeleton and third-party stubs (supabase,
+# trafilatura, docx) are incomplete. Tighten once the ML logic lands.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff.lint.isort]
+# The repo has a `modal/` directory, so isort would otherwise classify the
+# installed `modal` SDK as first-party and reorder the Modal scripts' imports.
+known-third-party = ["modal"]
+known-first-party = ["app", "pipeline", "common"]

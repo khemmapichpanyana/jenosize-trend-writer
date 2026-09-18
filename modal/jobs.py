@@ -16,10 +16,12 @@ from typing import Any
 from uuid import UUID
 
 import modal
-from eval import evaluate
-from train import train
 
-from common import MINUTES, app, app_image, pipeline_secret, r2_secret
+from common import MINUTES, app, app_image, models_volume, pipeline_secret, r2_secret
+from eval import evaluate
+from train import publish, train
+
+MODELS_DIR = "/models"
 
 # The worker blocks while a training call runs (~15-30 min, up to train's own
 # 180-min timeout), so it must outlive that. Its CPU container costs a small
@@ -27,9 +29,9 @@ from common import MINUTES, app, app_image, pipeline_secret, r2_secret
 WORKER_TIMEOUT = 200 * MINUTES
 
 
-async def _run_gpu(kind: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Run a GPU job and wait for it; GPU functions don't touch Postgres."""
-    fn = {"train": train, "eval": evaluate}[kind]
+async def _run_remote(kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Run a Modal function and wait for it; those functions don't touch Postgres."""
+    fn = {"train": train, "eval": evaluate, "publish": publish}[kind]
     return await fn.remote.aio(**params)
 
 
@@ -47,7 +49,7 @@ async def job_worker(job_id: str, kind: str, params: dict[str, Any]) -> dict[str
         params,
         settings=settings,
         storage=R2Storage(settings),
-        gpu_runner=_run_gpu,
+        remote_runner=_run_remote,
     )
 
 
@@ -80,8 +82,27 @@ class ModalDispatcher:
         # because the awaiting `.remote.aio()` is interrupted.
         await modal.FunctionCall.from_id(call_id).cancel.aio()
 
+    async def list_adapters(self) -> tuple[list[dict[str, Any]], str | None]:
+        from pipeline.adapters import read_active, scan_adapters
 
-@app.function(image=app_image, secrets=[r2_secret, pipeline_secret])
+        # The volume is mounted at container start; reload to see adapters a
+        # training job committed since then.
+        await models_volume.reload.aio()
+        return scan_adapters(MODELS_DIR), read_active(MODELS_DIR)
+
+    async def activate_adapter(self, version: str) -> None:
+        from pipeline.adapters import write_active
+
+        await models_volume.reload.aio()
+        write_active(MODELS_DIR, version)
+        await models_volume.commit.aio()
+
+
+@app.function(
+    image=app_image,
+    secrets=[r2_secret, pipeline_secret],
+    volumes={MODELS_DIR: models_volume},  # list/activate adapters
+)
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app(label="jenosize-trend-writer-jobs-api")
 def jobs_api():  # type: ignore[no-untyped-def]

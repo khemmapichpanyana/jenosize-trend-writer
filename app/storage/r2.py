@@ -89,6 +89,14 @@ class R2Storage:
 
         return await anyio.to_thread.run_sync(_head)
 
+    def signed_url(self, key: str, *, expires_s: int = 900) -> str | None:
+        # Signing is local HMAC work: no network call, safe on the event loop.
+        return str(
+            self._client.generate_presigned_url(
+                "get_object", Params={"Bucket": self._bucket, "Key": key}, ExpiresIn=expires_s
+            )
+        )
+
     async def health(self) -> None:
         def _head_bucket() -> None:
             self._client.head_bucket(Bucket=self._bucket)

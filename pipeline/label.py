@@ -33,6 +33,7 @@ from openai import AsyncOpenAI
 from app.core.logging import get_logger
 from app.services.normalize import normalize_industry, normalize_keywords, normalize_optional_text
 from pipeline._cli import echo_stats, pipeline_context, recorded_run, run_async
+from pipeline.clean import detect_language
 from pipeline.schemas import ArticleLabels, TrainingArticle
 from pipeline.store import CorpusStore
 
@@ -122,7 +123,10 @@ def build_labels(payload: dict, article: TrainingArticle) -> ArticleLabels:
         audience=normalize_optional_text(payload.get("audience")) or "Business leaders",
         keywords=normalize_keywords(raw_keywords),
         length=length_for(article.word_count),  # type: ignore[arg-type]
-        language=language_for(article.url),  # type: ignore[arg-type]
+        # From the text, not the URL: /en/ URLs on this site can hold Thai.
+        language=detect_language(article.clean_markdown or "")
+        if article.clean_markdown
+        else language_for(article.url),  # type: ignore[arg-type]
     )
 
 

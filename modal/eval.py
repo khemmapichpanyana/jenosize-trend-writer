@@ -23,7 +23,16 @@ import os
 import random
 from typing import Any
 
-from common import BASE_MODEL, MINUTES, app, app_image, r2_client, r2_secret, vllm_secret
+from common import (
+    BASE_MODEL,
+    MINUTES,
+    app,
+    app_image,
+    pipeline_secret,
+    r2_client,
+    r2_secret,
+    vllm_secret,
+)
 
 # Held-out briefs. `--briefs-uri r2://datasets/v1/eval.jsonl` replaces these with
 # the real held-out split; these three keep the harness runnable before then.
@@ -164,7 +173,8 @@ def _score(markdown: str, title: str, brief: dict[str, Any]) -> dict[str, Any]:
 
 @app.function(
     image=app_image,
-    secrets=[vllm_secret, r2_secret],
+    # jeno-pipeline carries the LABELER_* settings, reused as the default judge.
+    secrets=[vllm_secret, r2_secret, pipeline_secret],
     timeout=90 * MINUTES,
 )
 def evaluate(
@@ -175,7 +185,23 @@ def evaluate(
     judge_model: str | None = None,
     judge_endpoint: str | None = None,
     limit: int = 20,
+    judge: bool = False,
 ) -> dict:
+    """Base vs `adapter_name` on the held-out briefs.
+
+    With `judge=True` and no explicit judge, the labelling LLM (LABELER_*) is
+    the judge. It must not be the served model: a model grading itself against
+    its own fine-tune is not independent evidence.
+    """
+    judge_key = os.environ.get("VLLM_API_KEY", "not-needed")
+    if judge and not judge_model:
+        judge_model = os.environ.get("LABELER_MODEL")
+        judge_endpoint = os.environ.get("LABELER_BASE_URL")
+        judge_key = os.environ.get("LABELER_API_KEY") or "not-needed"
+        if not (judge_model and judge_endpoint):
+            raise RuntimeError(
+                "judge=True needs LABELER_BASE_URL and LABELER_MODEL in jeno-pipeline"
+            )
     from openai import OpenAI
 
     from app.services.llm import parse_article
@@ -216,6 +242,7 @@ def evaluate(
             verdict = _judge(
                 judge_endpoint or endpoint,
                 judge_model,
+                judge_key,
                 messages[1]["content"],
                 generated["base"][1],
                 generated["finetuned"][1],
@@ -233,12 +260,19 @@ def evaluate(
 
 
 def _judge(
-    endpoint: str, model: str, brief: str, output_a: str, output_b: str, *, seed: int
+    endpoint: str,
+    model: str,
+    api_key: str,
+    brief: str,
+    output_a: str,
+    output_b: str,
+    *,
+    seed: int,
 ) -> dict[str, Any]:
     """Blind pairwise comparison with randomised presentation order."""
     from openai import OpenAI
 
-    client = OpenAI(base_url=endpoint, api_key=os.environ.get("VLLM_API_KEY", "not-needed"))
+    client = OpenAI(base_url=endpoint, api_key=api_key)
     flipped = random.Random(seed).random() < 0.5
     first, second = (output_b, output_a) if flipped else (output_a, output_b)
 

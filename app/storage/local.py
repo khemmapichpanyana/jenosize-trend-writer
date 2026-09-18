@@ -45,5 +45,8 @@ class LocalStorage:
     async def exists(self, key: str) -> bool:
         return await anyio.Path(self._path(key)).exists()
 
+    def signed_url(self, key: str, *, expires_s: int = 900) -> str | None:
+        return None
+
     async def health(self) -> None:
         await anyio.to_thread.run_sync(lambda: self._root.mkdir(parents=True, exist_ok=True))

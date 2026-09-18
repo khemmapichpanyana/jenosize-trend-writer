@@ -22,7 +22,6 @@ APP_NAME = "jenosize-trend-writer"
 
 # Where the LoRA adapter and any cached weights live between runs.
 MODELS_VOLUME_NAME = "jeno-models"
-ADAPTER_DIR = "/models/jeno-lora-v1"
 
 BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -129,7 +128,8 @@ serve_image = (
     # huggingface_hub refuses to download at all.
     .uv_pip_install("vllm==0.11.0", "huggingface_hub>=0.26.0", "hf_transfer")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    .add_local_python_source("common")
+    # `pipeline.adapters` is stdlib-only; it decides which adapters to register.
+    .add_local_python_source("common", "pipeline")
 )
 
 # CPU image for everything that runs this repo's own code: the jobs API, job
@@ -141,4 +141,9 @@ app_image = (
     .pip_install_from_requirements(str(REPO_ROOT / "requirements.txt"))
     .uv_pip_install("psycopg[binary]>=3.2.0")
     .add_local_python_source("app", "pipeline", "common")
+    # POST /v1/migrations/apply reads these next to the pipeline package, where
+    # pipeline/migrate.py expects them (<root>/supabase/migrations).
+    .add_local_dir(
+        str(REPO_ROOT / "supabase" / "migrations"), remote_path="/root/supabase/migrations"
+    )
 )

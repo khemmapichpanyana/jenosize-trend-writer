@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     # Shared secret for the scrape/train endpoints. They spend money (GPU time,
     # labelling calls), so the jobs API refuses every request when this is unset.
     jobs_api_key: str | None = None
+    # Where trained adapters are mounted (the Modal volume `jeno-models`).
+    models_dir: str = "/models"
 
     # --- offline labeling (pipeline only, unused by the API) -----------------
     labeler_base_url: str | None = None

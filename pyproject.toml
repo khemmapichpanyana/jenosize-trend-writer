@@ -92,4 +92,4 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # The repo has a `modal/` directory, so isort would otherwise classify the
 # installed `modal` SDK as first-party and reorder the Modal scripts' imports.
 known-third-party = ["modal"]
-known-first-party = ["app", "pipeline", "common"]
+known-first-party = ["app", "pipeline", "common", "train", "eval", "serve", "jobs"]

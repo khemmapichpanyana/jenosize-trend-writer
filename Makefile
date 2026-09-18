@@ -70,8 +70,8 @@ modal-secrets:  ## Create/update the Modal secrets from .env (least privilege, v
 modal-doctor:  ## Check secrets, Postgres, R2 and imports from inside Modal (~1 cent)
 	$(UV) run modal run modal/doctor.py
 
-deploy-modal:  ## Deploy jobs API + vLLM server + train/eval (ADAPTER=v1 picks the served adapter)
-	JENO_ADAPTER_VERSION=$(or $(ADAPTER),v1) $(UV) run modal deploy modal/deploy.py
+deploy-modal:  ## Deploy jobs API + vLLM server + train/eval/publish (one-time bootstrap)
+	$(UV) run modal deploy modal/deploy.py
 
 jobs-dev:  ## Run the jobs API locally (scrape/label in-process; train/eval need Modal)
 	$(UV) run uvicorn --factory pipeline.api:create_local_app --reload --port 8001

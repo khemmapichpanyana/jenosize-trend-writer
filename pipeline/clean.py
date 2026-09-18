@@ -60,7 +60,7 @@ DROP_SECTIONS = re.compile(
 # Bump whenever a rule in this file changes. Every article whose clean_version
 # differs is re-cleaned on the next run (from the archived raw HTML in R2, so no
 # re-crawl); nothing else is touched.
-CLEAN_VERSION = 1
+CLEAN_VERSION = 2  # v2: Thai-language articles are rejected by language, not "too short"
 
 MIN_WORDS = 300
 MAX_WORDS = 4000
@@ -69,6 +69,23 @@ DUPLICATE_THRESHOLD = 0.6
 SHINGLE_SIZE = 5
 
 _HEADING = re.compile(r"^(#{1,6})\s*(.+?)\s*#*$")
+_THAI = re.compile(r"[\u0e00-\u0e7f]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def detect_language(text: str) -> str:
+    """ "th" or "en" by script, not by URL.
+
+    Found in the live corpus: some articles under /en/ URLs (with lang="en" in
+    the HTML) are written in Thai. Thai has no spaces between words, so a word
+    counter scores them as ~150 "words" and they were being rejected as too
+    short — the right outcome for the wrong reason, and a wrong language label
+    for anything that got through.
+    """
+    thai, latin = len(_THAI.findall(text)), len(_LATIN.findall(text))
+    return "th" if thai > latin else "en"
+
+
 _EMPHASIS = re.compile(r"(\*\*|__|\*|_)")
 _BLANKS = re.compile(r"\n{3,}")
 _WORD = re.compile(r"[A-Za-z0-9'฀-๿]+")
@@ -226,7 +243,14 @@ async def run_clean(
     import trafilatura
 
     pending = await store.due_for_clean(clean_version=CLEAN_VERSION)
-    stats = {"pending": len(pending), "cleaned": 0, "too_short": 0, "too_long": 0, "failed": 0}
+    stats = {
+        "pending": len(pending),
+        "cleaned": 0,
+        "too_short": 0,
+        "too_long": 0,
+        "wrong_language": 0,
+        "failed": 0,
+    }
 
     for article in pending:
         assert article.content_hash is not None  # guaranteed by due_for_clean
@@ -248,7 +272,12 @@ async def run_clean(
                 raise ValueError("no text extracted")
             body = clean_markdown(extracted, article.title)
             words = count_words(body)
-            if words < min_words:
+            if detect_language(body) != "en":
+                # v1 is an English style dataset; a handful of Thai articles
+                # would add noise, not a usable Thai signal.
+                stats["wrong_language"] += 1
+                error = "clean: Thai-language article under an /en/ URL (excluded from the English dataset)"
+            elif words < min_words:
                 stats["too_short"] += 1
                 error = f"clean: too short ({words} words)"
             elif words > max_words:
@@ -295,51 +324,50 @@ def run(min_words: int = MIN_WORDS, max_words: int = MAX_WORDS) -> None:
     run_async(_run)
 
 
+def corpus_stats(articles: list[TrainingArticle]) -> dict[str, object]:
+    """Corpus health numbers — shared by the CLI and `GET /v1/corpus/stats`."""
+    import statistics
+
+    usable = [a for a in articles if a.clean_markdown and not a.is_duplicate]
+    counts = [a.word_count for a in usable]
+    by_category: dict[str, int] = {}
+    for article in usable:
+        key = article.category_slug or "unknown"
+        by_category[key] = by_category.get(key, 0) + 1
+    rejected: dict[str, int] = {}
+    for article in articles:
+        if article.error:
+            reason = article.error.split(":", 1)[-1].split("(")[0].strip()
+            rejected[reason] = rejected.get(reason, 0) + 1
+    return {
+        "discovered": len(articles),
+        "usable": len(usable),
+        "duplicates": sum(1 for a in articles if a.is_duplicate),
+        "errors": sum(1 for a in articles if a.error),
+        "errors_by_reason": dict(sorted(rejected.items(), key=lambda kv: -kv[1])),
+        "words_min": min(counts) if counts else 0,
+        "words_median": int(statistics.median(counts)) if counts else 0,
+        "words_mean": int(statistics.mean(counts)) if counts else 0,
+        "words_max": max(counts) if counts else 0,
+        "words_total": sum(counts),
+        "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
+    }
+
+
 @app.command()
 def stats(json_out: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Corpus health — the numbers that populate the data card."""
 
     async def _run() -> None:
         import json
-        import statistics
 
         async with pipeline_context() as (_, store, _):
-            articles = await store.all()
-        usable = [a for a in articles if a.clean_markdown and not a.is_duplicate]
-        counts = [a.word_count for a in usable]
-
-        by_category: dict[str, int] = {}
-        for article in usable:
-            key = article.category_slug or "unknown"
-            by_category[key] = by_category.get(key, 0) + 1
-        by_category = dict(sorted(by_category.items(), key=lambda kv: -kv[1]))
-
-        payload: dict[str, object] = {
-            "discovered": len(articles),
-            "usable": len(usable),
-            "duplicates": sum(1 for a in articles if a.is_duplicate),
-            "errors": sum(1 for a in articles if a.error),
-            "words_min": min(counts) if counts else 0,
-            "words_median": int(statistics.median(counts)) if counts else 0,
-            "words_mean": int(statistics.mean(counts)) if counts else 0,
-            "words_max": max(counts) if counts else 0,
-            "words_total": sum(counts),
-            "by_category": by_category,
-        }
+            payload = corpus_stats(await store.all())
         if json_out:
             typer.echo(json.dumps(payload, indent=2))
             return
-        typer.echo(f"usable articles : {payload['usable']} / {payload['discovered']} discovered")
-        typer.echo(f"near-duplicates : {payload['duplicates']}")
-        typer.echo(f"errors          : {payload['errors']}")
-        typer.echo(
-            f"words           : min {payload['words_min']} · median {payload['words_median']}"
-            f" · mean {payload['words_mean']} · max {payload['words_max']}"
-            f" · total {payload['words_total']:,}"
-        )
-        typer.echo("by category:")
-        for category, count in by_category.items():
-            typer.echo(f"  {count:>4}  {category}")
+        for key, value in payload.items():
+            typer.echo(f"{key:<17}: {value}")
 
     run_async(_run)
 

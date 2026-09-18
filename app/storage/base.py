@@ -27,6 +27,14 @@ class Storage(Protocol):
         """Raise if the backend is unreachable."""
         ...
 
+    def signed_url(self, key: str, *, expires_s: int = 900) -> str | None:
+        """A temporary download link for one object, or None if unsupported.
+
+        The bucket stays private; a signed link lets a person open one raw page
+        without making everything public.
+        """
+        ...
+
 
 async def put_text(
     storage: Storage, key: str, text: str, *, content_type: str = "text/plain; charset=utf-8"

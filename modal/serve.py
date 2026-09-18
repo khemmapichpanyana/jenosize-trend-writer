@@ -28,18 +28,12 @@ from common import (
 )
 
 VLLM_PORT = 8000
-LORA_NAME = "jeno-lora"
 
-# Which trained adapter to serve. Training writes one directory per dataset
-# version (/models/jeno-lora-v1, -v2, …); switching versions is a redeploy with
-# JENO_ADAPTER_VERSION=v2, not a code change. Read at deploy time and baked
-# into the container env below.
-ADAPTER_VERSION = os.environ.get("JENO_ADAPTER_VERSION", "v1")
-ADAPTER_DIR = f"/models/jeno-lora-{ADAPTER_VERSION}"
 
 # 8192 covers the longest brief (retrieved chunks) plus a 1500-word article with
 # room to spare; raising it costs KV-cache memory on a 24 GB L4.
 MAX_MODEL_LEN = 8192
+MAX_LORA_RANK = 64  # must be >= the largest lora_r TrainParams accepts
 
 
 @app.server(
@@ -54,9 +48,6 @@ MAX_MODEL_LEN = 8192
     scaledown_window=5 * MINUTES,
     startup_timeout=10 * MINUTES,
     min_containers=int(os.environ.get("JENO_MIN_CONTAINERS", "0")),
-    # The container re-imports this module in its own environment, so the
-    # deploy-time choice must be passed in explicitly or it falls back to v1.
-    env={"JENO_ADAPTER_VERSION": ADAPTER_VERSION},
 )
 class VLLMServer:
     @modal.enter()
@@ -75,15 +66,22 @@ class VLLMServer:
             os.environ.get("VLLM_API_KEY", "not-needed"),
         ]
 
-        # The adapter only exists after `modal run modal/train.py` has committed
-        # it. Serving the base model instead of crashing keeps the endpoint
-        # usable on Day 0 and makes the base-vs-finetuned eval trivial.
-        if os.path.isdir(ADAPTER_DIR):
-            cmd += ["--enable-lora", "--lora-modules", f"{LORA_NAME}={ADAPTER_DIR}"]
-            print(f"[jeno] serving {BASE_MODEL} with LoRA '{LORA_NAME}' from {ADAPTER_DIR}")
+        # Every complete adapter on the volume is registered under its own name
+        # (jeno-lora-v1, jeno-lora-v2, ...), plus `jeno-lora` for the active one
+        # (POST /v1/adapters/{v}/activate). Eval can then compare any version
+        # against the base model on the same server, and the product API just
+        # asks for `jeno-lora`. With no adapter yet, the base model is served.
+        from pipeline.adapters import read_active, vllm_lora_args
+
+        lora_args = vllm_lora_args("/models")
+        if lora_args:
+            # vLLM's default --max-lora-rank is 16; the jobs API allows r up to
+            # 64, and an adapter above the limit fails to load at start-up.
+            cmd += ["--enable-lora", "--max-lora-rank", str(MAX_LORA_RANK), *lora_args]
+            print(f"[jeno] LoRA modules: {lora_args[1:]} (active: {read_active('/models')})")
         else:
             print(
-                f"[jeno] WARNING: no adapter at {ADAPTER_DIR}; serving base model only. "
+                f"[jeno] WARNING: no trained adapter under /models; serving {BASE_MODEL} only. "
                 f"Set MODEL_NAME={BASE_MODEL} on the backend until training lands."
             )
 

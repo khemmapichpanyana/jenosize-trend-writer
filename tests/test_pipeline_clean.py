@@ -5,6 +5,7 @@ from __future__ import annotations
 from pipeline.clean import (
     clean_markdown,
     count_words,
+    detect_language,
     drop_leading_title,
     drop_sections,
     find_duplicates,
@@ -165,3 +166,10 @@ def test_sections_stay_top_level_when_the_title_is_the_only_shallow_heading() ->
     assert result.startswith("Intro.")
     assert "## What are Megatrends?" in result
     assert "###" not in result
+
+
+def test_language_is_detected_from_the_text_not_the_url() -> None:
+    # Real case: jenosize.com/en/ideas/.../dopamine-detox is written in Thai.
+    assert detect_language("เทรนด์การทำ โดพามีนดีท็อกซ์ ที่กำลังมาแรง") == "th"
+    assert detect_language("Agentic AI changes how retail works") == "en"
+    assert detect_language("AI และ Data ช่วยให้ธุรกิจเติบโตอย่างยั่งยืน") == "th"

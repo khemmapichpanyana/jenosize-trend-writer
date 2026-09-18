@@ -199,35 +199,38 @@ bypasses RLS; it must never reach a browser.
 
 ---
 
-## Fine-tuning workflow
+## Fine-tuning workflow (API-driven)
 
-**Full guide: [`docs/fine_tuning_workflow.md`](docs/fine_tuning_workflow.md)**, from
-setup to scraping, cleaning, labelling, dataset, training, serving and eval.
+**Full guide: [`docs/fine_tuning_workflow.md`](docs/fine_tuning_workflow.md)**, with
+ready-to-send requests in [`docs/jobs_api.http`](docs/jobs_api.http) and the plan
+in [`docs/test_execution_plan.csv`](docs/test_execution_plan.csv).
 
-```bash
-make install && make migrate && make modal-doctor && make deploy-modal   # once
+After a one-time bootstrap (`uv run modal setup`, `make modal-secrets`,
+`make deploy-modal`), every step is an HTTP call to the **jobs API** on Modal.
+Long-running calls return `202` with a run id; poll `GET /v1/runs/{id}`.
 
-# then, via the jobs API (or the equivalent make targets):
-POST /v1/scrape                     # pull new articles        (make scrape)
-POST /v1/label                      # reverse-label            (make label)
-POST /v1/datasets {"version":"v1"}  # publish immutable v1     (make dataset VERSION=v1)
-POST /v1/train    {"version":"v1"}  # QLoRA on a Modal L4      (make train VERSION=v1)
-POST /v1/eval     {"version":"v1", "endpoint": "<vllm>/v1"}
-GET  /v1/runs/{id}                  # status + per-stage stats
+```
+POST /v1/migrations/apply             set up the schema (idempotent)
+POST /v1/scrape                       pull new articles: discover → crawl → clean
+GET  /v1/corpus/stats · /corpus/sample   review what was pulled
+POST /v1/label/preview → /v1/label    reverse-label (preview one first)
+POST /v1/datasets {"version":"v1"}    publish an immutable, validated dataset
+POST /v1/train    {"version":"v1"}    QLoRA on a Modal L4
+POST /v1/eval     {"version":"v1", "endpoint": …, "judge": true}
+POST /v1/adapters/v1/activate · /publish
 ```
 
-The data pipeline writes **only to Postgres (`DATABASE_URL`) and Cloudflare
-R2**. There is no local copy. Every stage is **incremental**: it records the
-content fingerprint it last processed, and a re-run touches only what changed.
+The pipeline writes **only to Postgres and Cloudflare R2**, and every stage is
+**incremental**: it records the content fingerprint it last processed, so a
+re-run touches only what changed.
 
 | Stage | What it writes, and when |
 |---|---|
-| **scrape** | New URLs only. Raw HTML goes to R2 only when the article's *extracted-text* fingerprint is new or changed. Sitemap dates and raw-HTML hashes were measured and are useless on this site. Truncated responses are retried, never stored. |
-| **clean** | Only articles whose fingerprint (or `CLEAN_VERSION`) changed. Reads raw HTML back from R2. Drops CTA and **reference sections**, because a model that learns to write bibliographies invents sources. |
-| **label** | Only articles whose cleaned content changed. Category, language and length are derived, not inferred. Inferred fields go through the API's own normalizers. |
-| **build** | Rendered through `app/services/prompt.py`, byte-identical to inference (enforced by a test). Validated before upload. **Versions are immutable**; an unchanged corpus writes nothing. |
-
-Every run is logged in `pipeline_runs`, and `make status` shows it.
+| **scrape** | New URLs only. Raw HTML goes to R2 only when the *extracted-text* fingerprint is new or changed. Sitemap dates and raw-HTML hashes were measured and are useless on this site. Truncated responses are retried, never stored. |
+| **clean** | Only changed articles. Drops CTA and **reference sections** (a model that learns bibliographies invents sources) and Thai pages served under `/en/` URLs. |
+| **label** | Only changed articles. Category, length and language are derived, not inferred. Inferred fields go through the API's own normalizers. |
+| **dataset** | Rendered through `app/services/prompt.py`, byte-identical to inference (enforced by a test). Validated before upload. **Versions are immutable.** |
+| **serve** | Every trained version is served by name (`jeno-lora-v1`, …) plus the `jeno-lora` alias for the active one. |
 
 ---
 

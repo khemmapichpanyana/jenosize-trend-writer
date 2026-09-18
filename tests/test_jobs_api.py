@@ -7,7 +7,9 @@ what it was asked to do.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,6 +26,8 @@ KEY = {"X-API-Key": "test-key"}
 
 
 class FakeGpu:
+    """Stands in for the Modal functions (train / eval / publish)."""
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -31,11 +35,25 @@ class FakeGpu:
         self.calls.append((kind, params))
         if kind == "train":
             return {"train_loss": 1.23, "steps": 10}
+        if kind == "publish":
+            return {
+                "repo_id": params["repo_id"],
+                "url": f"https://huggingface.co/{params['repo_id']}",
+            }
         return {"summary": {"n_briefs": 2}, "results": ["large", "payload"]}
 
 
+def _fake_adapter(models_dir: Path, version: str, loss: float = 1.0) -> None:
+    folder = models_dir / f"jeno-lora-{version}"
+    folder.mkdir(parents=True)
+    (folder / "adapter_config.json").write_text("{}")
+    (folder / "jeno_train_metrics.json").write_text(json.dumps({"train_loss": loss}))
+
+
 @pytest.fixture
-def settings(pg_dsn: str, r2: Any) -> Settings:  # overrides the API fixture of the same name
+def settings(
+    pg_dsn: str, r2: Any, tmp_path: Path
+) -> Settings:  # overrides the API fixture of the same name
     return r2._settings.model_copy(
         update={
             "database_url": pg_dsn,
@@ -43,6 +61,7 @@ def settings(pg_dsn: str, r2: Any) -> Settings:  # overrides the API fixture of 
             "labeler_base_url": "http://labeler.invalid/v1",
             "labeler_model": "fake-model",
             "log_level": "WARNING",
+            "models_dir": str(tmp_path / "models"),
         }
     )
 
@@ -54,19 +73,23 @@ def gpu() -> FakeGpu:
 
 @pytest.fixture
 def dispatcher(settings: Settings, r2: Any, gpu: FakeGpu) -> InlineDispatcher:
-    return InlineDispatcher(settings, r2, gpu_runner=gpu)
+    return InlineDispatcher(settings, r2, remote_runner=gpu)
 
 
 @pytest.fixture
 async def api(
-    corpus: Any, settings: Settings, dispatcher: InlineDispatcher, monkeypatch: pytest.MonkeyPatch
+    corpus: Any,
+    settings: Settings,
+    r2: Any,
+    dispatcher: InlineDispatcher,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     # `corpus` truncates the tables; job_runs too, since tests share one database.
     async with connect_jobs(settings.database_url or "") as (_, _jobs):
         await _jobs._conn.execute("truncate job_runs cascade")
     monkeypatch.setattr(label, "labeler_client", lambda *_: FakeLabeler())
     monkeypatch.setattr("pipeline.scrape.asyncio.sleep", _no_sleep)
-    app = create_jobs_app(dispatcher, settings)
+    app = create_jobs_app(dispatcher, settings, r2)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://jobs") as client:
         yield client
 
@@ -259,10 +282,12 @@ async def test_eval_job_keeps_only_the_summary(
     api: AsyncClient,
     dispatcher: InlineDispatcher,
     gpu: FakeGpu,
+    settings: Settings,
     site: FakeSite,  # noqa: F811
 ) -> None:
     await _scraped_and_labelled(api, dispatcher)
     await api.post("/v1/datasets", headers=KEY, json={"version": "v1", "eval_frac": 0.0})
+    _fake_adapter(Path(settings.models_dir), "v1")
 
     run = await _finish(
         api,
@@ -273,6 +298,9 @@ async def test_eval_job_keeps_only_the_summary(
     )
     assert run["result"] == {"summary": {"n_briefs": 2}}
     assert gpu.calls[-1][1]["briefs_uri"] == "r2://datasets/v1/eval.jsonl"
+    # Compares base against *this* version, not whatever the alias points at.
+    assert gpu.calls[-1][1]["adapter_name"] == "jeno-lora-v1"
+    assert gpu.calls[-1][1]["judge"] is False
 
 
 async def test_gpu_jobs_fail_cleanly_without_a_gpu_runner(
@@ -290,14 +318,14 @@ async def test_gpu_jobs_fail_cleanly_without_a_gpu_runner(
             card_key="c",
             params={},
         )
-    no_gpu = InlineDispatcher(settings, r2, gpu_runner=None)
+    no_gpu = InlineDispatcher(settings, r2, remote_runner=None)
     app = create_jobs_app(no_gpu, settings)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://jobs") as client:
         response = await client.post("/v1/train", headers=KEY, json={"version": "v1"})
         await no_gpu.drain()
         run = (await client.get(f"/v1/runs/{response.json()['id']}", headers=KEY)).json()
     assert run["status"] == "failed"
-    assert "run on Modal GPUs" in run["error"]
+    assert "run on Modal" in run["error"]
 
 
 # ----------------------------------------------------------------- runs
@@ -314,3 +342,160 @@ async def test_unknown_run_is_404(api: AsyncClient) -> None:
     response = await api.get("/v1/runs/00000000-0000-0000-0000-000000000000", headers=KEY)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+# ----------------------------------------------------------------- setup over HTTP
+
+
+async def test_config_reports_hosts_not_secrets(
+    settings: Settings, dispatcher: InlineDispatcher, r2: Any
+) -> None:
+    # Distinctive values, so a leak cannot hide behind a common substring.
+    secrets = {
+        "r2_secret_access_key": "r2-secret-7f3a9c",
+        "labeler_api_key": "labeler-secret-5e1d2b",
+        "jobs_api_key": "jobs-secret-9b8c7d",
+    }
+    app = create_jobs_app(dispatcher, settings.model_copy(update=secrets), r2)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://jobs") as client:
+        body = (await client.get("/v1/config", headers={"X-API-Key": "jobs-secret-9b8c7d"})).json()
+    assert body["r2_bucket"] == settings.r2_bucket
+    assert body["configured"] == {"database": True, "r2": True, "labeler": True}
+    serialized = json.dumps(body)
+    assert not [name for name, value in secrets.items() if value in serialized]
+    assert settings.database_url and settings.database_url not in serialized
+
+
+async def test_migrations_are_listed_and_applying_is_idempotent(api: AsyncClient) -> None:
+    listed = (await api.get("/v1/migrations", headers=KEY)).json()
+    assert [m["name"] for m in listed][:2] == ["0001_init.sql", "0002_training_article_fields.sql"]
+    assert all(m["applied"] for m in listed)
+    applied = (await api.post("/v1/migrations/apply", headers=KEY)).json()
+    assert applied == {"applied": [], "status": "up to date"}
+
+
+async def test_doctor_checks_every_dependency(api: AsyncClient, settings: Settings) -> None:
+    _fake_adapter(Path(settings.models_dir), "v1")
+    checks = {c["check"]: c for c in (await api.get("/v1/doctor", headers=KEY)).json()}
+    assert checks.keys() == {"database", "r2", "labeler", "adapters"}
+    assert all(c["ok"] for c in checks.values()), checks
+    assert "active: v1" in checks["adapters"]["detail"]
+
+
+# ----------------------------------------------------------------- corpus browsing
+
+
+async def test_corpus_browsing_after_a_scrape(
+    api: AsyncClient,
+    dispatcher: InlineDispatcher,
+    site: FakeSite,  # noqa: F811
+) -> None:
+    await _finish(api, dispatcher, await api.post("/v1/scrape", headers=KEY))
+
+    stats = (await api.get("/v1/corpus/stats", headers=KEY)).json()
+    assert stats["usable"] == 3 and stats["by_category"] == {"futurist": 3}
+
+    page = (await api.get("/v1/corpus/articles?state=cleaned&limit=2", headers=KEY)).json()
+    assert page["total"] == 3 and len(page["items"]) == 2
+
+    url = page["items"][0]["url"]
+    article = (await api.get("/v1/corpus/article", params={"url": url}, headers=KEY)).json()
+    assert article["clean_markdown"].count("## ") >= 3
+    assert article["r2_raw_key"].startswith("raw/scrape/")
+    # The bucket stays private; the API hands out a temporary signed link.
+    assert "Signature=" in article["raw_url"]
+
+    sample = (await api.get("/v1/corpus/sample?n=2", headers=KEY)).json()
+    assert len(sample) == 2 and all(a["clean_markdown"] for a in sample)
+
+    missing = await api.get("/v1/corpus/article", params={"url": "https://nope"}, headers=KEY)
+    assert missing.status_code == 404
+
+
+async def test_label_preview_writes_nothing(
+    api: AsyncClient,
+    dispatcher: InlineDispatcher,
+    site: FakeSite,  # noqa: F811
+) -> None:
+    await _finish(api, dispatcher, await api.post("/v1/scrape", headers=KEY))
+    preview = (await api.post("/v1/label/preview", headers=KEY)).json()
+    assert preview["labels"]["topic"] and preview["written"] is False
+    assert (await api.get("/v1/corpus", headers=KEY)).json()["counts"]["labelled"] == 0
+
+
+async def test_dataset_validate_card_and_examples(
+    api: AsyncClient,
+    dispatcher: InlineDispatcher,
+    site: FakeSite,  # noqa: F811
+) -> None:
+    await _scraped_and_labelled(api, dispatcher)
+    await api.post("/v1/datasets", headers=KEY, json={"version": "v1", "eval_frac": 0.0})
+
+    validation = (await api.get("/v1/datasets/v1/validate", headers=KEY)).json()
+    assert validation == {"version": "v1", "train": 3, "eval": 0, "ok": True, "problems": []}
+
+    card = await api.get("/v1/datasets/v1/card", headers=KEY)
+    assert card.headers["content-type"].startswith("text/markdown")
+    assert "# Data Card" in card.text
+
+    examples = (await api.get("/v1/datasets/v1/examples?n=1", headers=KEY)).json()
+    assert [m["role"] for m in examples[0]["messages"]] == ["system", "user", "assistant"]
+
+    assert (await api.get("/v1/datasets/v9/card", headers=KEY)).status_code == 404
+
+
+# ----------------------------------------------------------------- adapters
+
+
+async def test_adapters_list_and_activate(api: AsyncClient, settings: Settings) -> None:
+    models = Path(settings.models_dir)
+    _fake_adapter(models, "v1", loss=1.5)
+    _fake_adapter(models, "v2", loss=1.1)
+
+    listed = (await api.get("/v1/adapters", headers=KEY)).json()
+    # Newest is active until one is chosen explicitly.
+    assert [(a["version"], a["active"]) for a in listed] == [("v1", False), ("v2", True)]
+    assert listed[0]["served_as"] == "jeno-lora-v1"
+    assert listed[1]["metrics"] == {"train_loss": 1.1}
+
+    after = (await api.post("/v1/adapters/v1/activate", headers=KEY)).json()
+    assert [(a["version"], a["active"]) for a in after] == [("v1", True), ("v2", False)]
+    assert (await api.post("/v1/adapters/v7/activate", headers=KEY)).status_code == 404
+
+
+async def test_eval_requires_a_trained_adapter(
+    api: AsyncClient,
+    dispatcher: InlineDispatcher,
+    site: FakeSite,  # noqa: F811
+) -> None:
+    await _scraped_and_labelled(api, dispatcher)
+    await api.post("/v1/datasets", headers=KEY, json={"version": "v1", "eval_frac": 0.0})
+    response = await api.post(
+        "/v1/eval", headers=KEY, json={"version": "v1", "endpoint": "https://x.modal.run/v1"}
+    )
+    assert response.status_code == 404
+    assert "POST /v1/train" in response.json()["error"]["message"]
+
+
+async def test_publish_is_a_job(
+    api: AsyncClient, dispatcher: InlineDispatcher, gpu: FakeGpu, settings: Settings
+) -> None:
+    _fake_adapter(Path(settings.models_dir), "v1")
+    response = await api.post(
+        "/v1/adapters/v1/publish", headers=KEY, json={"version": "v1", "repo_id": "me/jeno-lora"}
+    )
+    run = await _finish(api, dispatcher, response)
+    assert run["status"] == "succeeded"
+    assert run["result"]["url"] == "https://huggingface.co/me/jeno-lora"
+    assert gpu.calls[-1] == (
+        "publish",
+        {"version": "v1", "repo_id": "me/jeno-lora", "private": False},
+    )
+
+
+async def test_publish_rejects_a_malformed_repo_id(api: AsyncClient, settings: Settings) -> None:
+    _fake_adapter(Path(settings.models_dir), "v1")
+    response = await api.post(
+        "/v1/adapters/v1/publish", headers=KEY, json={"version": "v1", "repo_id": "no-slash"}
+    )
+    assert response.status_code == 422

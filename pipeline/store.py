@@ -14,8 +14,9 @@ ever deleted: failures are recorded in `error`, duplicates are flagged.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +36,21 @@ def _article(row: dict[str, Any]) -> TrainingArticle:
     data["word_count"] = data.get("word_count") or 0
     data["is_duplicate"] = bool(data.get("is_duplicate"))
     return TrainingArticle.model_validate(data)
+
+
+# Corpus browsing filters: a fixed map, so no caller-supplied SQL ever reaches a
+# query string.
+ARTICLE_STATES: Mapping[str, str] = MappingProxyType(
+    {
+        "all": "true",
+        "pending": "content_hash is null",
+        "fetched": "content_hash is not null",
+        "cleaned": "clean_markdown is not null and not is_duplicate",
+        "rejected": "error is not null",
+        "duplicates": "is_duplicate",
+        "labelled": "labelled_hash is not null and labelled_hash = cleaned_hash",
+    }
+)
 
 
 class CorpusStore:
@@ -283,6 +299,38 @@ class CorpusStore:
             f"insert into dataset_versions ({columns}) values ({placeholders}){conflict}",
             fields,
         )
+
+    # ----------------------------------------------------------- browsing
+
+    async def list_articles(
+        self, *, state: str = "all", category: str | None = None, limit: int = 50, offset: int = 0
+    ) -> tuple[int, list[TrainingArticle]]:
+        """Page through the corpus by pipeline state (the predicate is a fixed map)."""
+        where = ARTICLE_STATES[state]
+        params = {"category": category, "limit": limit, "offset": offset}
+        filters = f"({where}) and (%(category)s::text is null or category_slug = %(category)s)"
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"select count(*) as n from training_articles where {filters}", params
+            )
+            total = int((await cur.fetchone() or {"n": 0})["n"])
+            await cur.execute(
+                f"select {_COLUMNS} from training_articles where {filters} "
+                "order by url limit %(limit)s offset %(offset)s",
+                params,
+            )
+            return total, [_article(r) for r in await cur.fetchall()]
+
+    async def sample(self, *, n: int, labelled: bool, seed: float) -> list[TrainingArticle]:
+        """A reproducible random sample of cleaned articles, for human review."""
+        where = ARTICLE_STATES["labelled" if labelled else "cleaned"]
+        async with self._conn.cursor() as cur:
+            await cur.execute("select setseed(%s)", (seed,))
+            await cur.execute(
+                f"select {_COLUMNS} from training_articles where {where} order by random() limit %s",
+                (n,),
+            )
+            return [_article(r) for r in await cur.fetchall()]
 
     # ----------------------------------------------------------- reporting
 

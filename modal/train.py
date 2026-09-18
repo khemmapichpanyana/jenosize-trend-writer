@@ -20,7 +20,6 @@ import json
 import os
 
 from common import (
-    ADAPTER_DIR,
     BASE_MODEL,
     MINUTES,
     VOLUMES,
@@ -93,7 +92,7 @@ def train(
     epochs: int = EPOCHS,
     lora_r: int = LORA_R,
     learning_rate: float = LEARNING_RATE,
-    adapter_dir: str = ADAPTER_DIR,
+    adapter_dir: str = "/models/jeno-lora-v1",
 ) -> dict:
     # isort: off
     # Unsloth patches transformers/trl at import time, so it MUST be imported
@@ -204,6 +203,33 @@ def train(
         print(f"[jeno] pushed to https://huggingface.co/{HF_REPO}")
 
     return metrics
+
+
+@app.function(image=train_image, volumes=VOLUMES, secrets=[hf_secret], timeout=30 * MINUTES)
+def publish(version: str, repo_id: str, private: bool = False) -> dict:
+    """Upload /models/jeno-lora-{version} to the Hugging Face Hub.
+
+    Separate from training so an adapter is published only after it has been
+    evaluated, not as a side effect of every run.
+    """
+    from huggingface_hub import HfApi
+
+    folder = f"/models/jeno-lora-{version}"
+    if not os.path.isfile(f"{folder}/adapter_config.json"):
+        raise FileNotFoundError(f"no complete adapter at {folder}")
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
+    commit = api.upload_folder(
+        folder_path=folder,
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=f"jeno-lora {version}",
+    )
+    return {
+        "repo_id": repo_id,
+        "url": f"https://huggingface.co/{repo_id}",
+        "commit": str(commit.oid),
+    }
 
 
 @app.local_entrypoint()

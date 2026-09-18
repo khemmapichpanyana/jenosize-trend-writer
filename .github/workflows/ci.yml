@@ -8,6 +8,24 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # A disposable Postgres for the pipeline's integration tests. The pipeline's
+    # correctness lives in SQL ("which rows changed since the last run?"), so it
+    # is tested against the real thing, not a mock.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jeno_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/jeno_test
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,7 +34,7 @@ jobs:
           enable-cache: true
 
       - name: Install
-        run: uv sync --group dev --frozen
+        run: uv sync --group dev --group pipeline --frozen
 
       - name: Lint
         run: |
@@ -26,7 +44,7 @@ jobs:
       - name: Typecheck
         run: uv run mypy
 
-      - name: Test
+      - name: Test (incl. Postgres + S3-compatible R2 integration)
         run: uv run pytest
 
       # The whole point of the mock provider: CI proves the service generates an
@@ -46,7 +64,7 @@ jobs:
 
       - name: Check the Vercel bundle stays light
         run: |
-          if grep -Eiq '^(torch|transformers|unsloth|trl|vllm|bitsandbytes)([=<>~[]|$)' requirements.txt; then
-            echo "::error::heavy ML dependency leaked into requirements.txt (Vercel 500 MB limit)"
+          if grep -Eiq '^(torch|transformers|unsloth|trl|vllm|bitsandbytes|modal|psycopg)([=<>~[]|$)' requirements.txt; then
+            echo "::error::a non-runtime dependency leaked into requirements.txt (Vercel 500 MB limit)"
             exit 1
           fi

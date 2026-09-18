@@ -16,8 +16,10 @@ from collections.abc import Iterable
 import typer
 
 from app.core.logging import get_logger
-from pipeline._cli import context, run_async
+from app.storage.base import Storage
+from pipeline._cli import echo_stats, pipeline_context, recorded_run, run_async
 from pipeline.schemas import TrainingArticle
+from pipeline.store import CorpusStore
 
 logger = get_logger(__name__)
 app = typer.Typer(help="Clean archived HTML into training markdown.")
@@ -54,6 +56,11 @@ DROP_SECTIONS = re.compile(
     r"related (articles?|reading)|read more|about (the )?author|about jenosize)\b",
     re.IGNORECASE,
 )
+
+# Bump whenever a rule in this file changes. Every article whose clean_version
+# differs is re-cleaned on the next run (from the archived raw HTML in R2, so no
+# re-crawl); nothing else is touched.
+CLEAN_VERSION = 1
 
 MIN_WORDS = 300
 MAX_WORDS = 4000
@@ -208,93 +215,96 @@ def find_duplicates(articles: Iterable[TrainingArticle]) -> set[str]:
     return duplicates
 
 
-@app.command()
-def run(
+async def run_clean(
+    store: CorpusStore,
+    storage: Storage,
+    *,
     min_words: int = MIN_WORDS,
     max_words: int = MAX_WORDS,
-    reclean: bool = typer.Option(False, help="Re-clean articles that already have markdown."),
-) -> None:
-    """Clean every archived article, then flag near-duplicates corpus-wide."""
+) -> dict[str, int]:
+    """Clean only articles whose content or cleaning rules changed since last time."""
+    import trafilatura
 
-    async def _run() -> None:
-        import trafilatura
+    pending = await store.due_for_clean(clean_version=CLEAN_VERSION)
+    stats = {"pending": len(pending), "cleaned": 0, "too_short": 0, "too_long": 0, "failed": 0}
 
-        _, store, storage = context()
-        articles = await store.all()
-        pending = [a for a in articles if a.raw_key and (reclean or not a.clean_markdown)]
-        if not pending:
-            typer.echo("nothing to clean — run `scrape crawl` first, or pass --reclean")
-            return
-
-        typer.echo(f"cleaning {len(pending)} articles…")
-        updated: list[TrainingArticle] = []
-        too_short = too_long = failed = 0
-
-        for article in pending:
-            try:
-                raw = await storage.get_bytes(article.raw_key or "")
-                extracted = trafilatura.extract(
-                    raw.decode("utf-8", errors="replace"),
-                    url=article.url,
-                    output_format="markdown",
-                    include_formatting=True,
-                    include_tables=True,
-                    include_comments=False,
-                    favor_precision=True,
-                )
-            except Exception as exc:  # one bad page must not stop the run
-                failed += 1
-                updated.append(article.merged(error=f"clean: {exc}"[:300]))
-                continue
-
+    for article in pending:
+        assert article.content_hash is not None  # guaranteed by due_for_clean
+        markdown: str | None = None
+        words = 0
+        error: str | None = None
+        try:
+            raw = await storage.get_bytes(article.r2_raw_key or "")
+            extracted = trafilatura.extract(
+                raw.decode("utf-8", errors="replace"),
+                url=article.url,
+                output_format="markdown",
+                include_formatting=True,
+                include_tables=True,
+                include_comments=False,
+                favor_precision=True,
+            )
             if not extracted:
-                failed += 1
-                updated.append(article.merged(error="clean: no text extracted"))
-                continue
-
+                raise ValueError("no text extracted")
             body = clean_markdown(extracted, article.title)
             words = count_words(body)
             if words < min_words:
-                too_short += 1
-                updated.append(article.merged(error=f"too short: {words} words"))
-                continue
-            if words > max_words:
-                too_long += 1
-                updated.append(article.merged(error=f"too long: {words} words"))
-                continue
+                stats["too_short"] += 1
+                error = f"clean: too short ({words} words)"
+            elif words > max_words:
+                stats["too_long"] += 1
+                error = f"clean: too long ({words} words)"
+            else:
+                stats["cleaned"] += 1
+                markdown = body
+        except Exception as exc:  # one bad page must not stop the run
+            stats["failed"] += 1
+            error = f"clean: {exc}"
+            logger.warning("clean_failed", extra={"url": article.url, "error": str(exc)})
 
-            updated.append(article.merged(clean_markdown=body, word_count=words, error=None))
-
-        await store.upsert_many(updated)
-
-        # Duplicate detection runs over the whole corpus, not just this batch,
-        # because a new article can duplicate an old one.
-        everything = await store.all()
-        duplicate_urls = find_duplicates([a for a in everything if a.clean_markdown])
-        if duplicate_urls:
-            await store.upsert_many(
-                [a.merged(is_duplicate=True) for a in everything if a.url in duplicate_urls]
-            )
-
-        kept = sum(1 for a in updated if a.clean_markdown)
-        typer.echo(
-            f"cleaned={kept}  too_short={too_short}  too_long={too_long}  "
-            f"failed={failed}  near_duplicates={len(duplicate_urls)}"
+        await store.record_clean(
+            article.url,
+            content_hash=article.content_hash,
+            clean_version=CLEAN_VERSION,
+            clean_markdown=markdown,
+            word_count=words,
+            error=error,
         )
+
+    # Duplicates are a corpus-wide property: a new article can duplicate an old
+    # one, so this pass always covers everything, not just this batch. It only
+    # reads markdown already in Postgres, so it is cheap.
+    duplicates = find_duplicates(await store.cleaned())
+    await store.set_duplicates(duplicates)
+    stats["near_duplicates"] = len(duplicates)
+    return stats
+
+
+@app.command()
+def run(min_words: int = MIN_WORDS, max_words: int = MAX_WORDS) -> None:
+    """Clean new/changed articles (or all of them after a CLEAN_VERSION bump)."""
+
+    async def _run() -> None:
+        async with pipeline_context() as (_, store, storage):
+            async with recorded_run(store, "clean") as stats:
+                stats.update(
+                    await run_clean(store, storage, min_words=min_words, max_words=max_words)
+                )
+            echo_stats("clean", stats)
 
     run_async(_run)
 
 
 @app.command()
 def stats(json_out: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
-    """Corpus health — the numbers that populate docs/data_card.md."""
+    """Corpus health — the numbers that populate the data card."""
 
     async def _run() -> None:
         import json
         import statistics
 
-        _, store, _ = context()
-        articles = await store.all()
+        async with pipeline_context() as (_, store, _):
+            articles = await store.all()
         usable = [a for a in articles if a.clean_markdown and not a.is_duplicate]
         counts = [a.word_count for a in usable]
 
@@ -316,7 +326,6 @@ def stats(json_out: bool = typer.Option(False, "--json", help="Machine-readable 
             "words_total": sum(counts),
             "by_category": by_category,
         }
-
         if json_out:
             typer.echo(json.dumps(payload, indent=2))
             return

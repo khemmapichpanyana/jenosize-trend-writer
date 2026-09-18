@@ -95,15 +95,34 @@ def _load_briefs(uri: str | None) -> list[dict[str, Any]]:
             continue
         row = json.loads(line)
         messages = row["messages"]
+        user = messages[1]["content"]
         briefs.append(
             {
                 "system": messages[0]["content"],
-                "user": messages[1]["content"],
+                "user": user,
                 "reference": messages[2]["content"],
                 "url": (row.get("meta") or {}).get("url"),
+                # Recovered from the rendered brief so the deterministic scores
+                # judge each article against *its* keywords and length, not
+                # defaults (which would make keyword coverage trivially 100%).
+                **_brief_fields(user),
             }
         )
     return briefs
+
+
+def _brief_fields(user_prompt: str) -> dict[str, Any]:
+    import re
+
+    fields: dict[str, Any] = {}
+    if match := re.search(r"^Topic: (.+)$", user_prompt, re.MULTILINE):
+        fields["topic"] = match.group(1).strip()
+    if match := re.search(r"^SEO keywords: (.+)$", user_prompt, re.MULTILINE):
+        fields["keywords"] = [k.strip() for k in match.group(1).split(",") if k.strip()]
+    if match := re.search(r"^Target length: about (\d+) words$", user_prompt, re.MULTILINE):
+        words = int(match.group(1))
+        fields["length"] = {600: "short", 1000: "medium", 1500: "long"}.get(words, "medium")
+    return fields
 
 
 def _messages_for(brief: dict[str, Any]) -> list[dict[str, str]]:

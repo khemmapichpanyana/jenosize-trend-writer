@@ -1,17 +1,20 @@
 """Corpus records shared by every pipeline stage.
 
-One model flows through all four stages, gaining fields as it goes:
+One row per article in `training_articles`. Each stage writes its own columns
+and records the content fingerprint it worked from, which is how the next run
+knows whether there is anything left to do:
 
-    scrape  -> url, category_slug, title, meta_description, raw_key, content_hash
-    clean   -> clean_markdown, word_count, is_duplicate
-    label   -> labels (the reverse-engineered brief)
-    build   -> split
+    discover -> url, category_slug
+    crawl    -> content_hash (fingerprint), r2_raw_key, title, meta_description
+    clean    -> clean_markdown, word_count, cleaned_hash, clean_version
+    label    -> labels, labelled_hash, label_version, labeler_model
+    build    -> split
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -41,7 +44,7 @@ class TrainingArticle(BaseModel):
     category_slug: str | None = None
     title: str | None = None
     meta_description: str | None = None
-    raw_key: str | None = None
+    r2_raw_key: str | None = None
     content_hash: str | None = None
     clean_markdown: str | None = None
     word_count: int = 0
@@ -49,8 +52,11 @@ class TrainingArticle(BaseModel):
     labels: ArticleLabels | None = None
     split: Split = "train"
     error: str | None = None
-    fetched_at: datetime | None = None
-
-    def merged(self, **fields: Any) -> TrainingArticle:
-        """Copy with `fields` applied — stages never mutate a record in place."""
-        return self.model_copy(update=fields)
+    first_seen_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    content_changed_at: datetime | None = None
+    cleaned_hash: str | None = None
+    clean_version: int | None = None
+    labelled_hash: str | None = None
+    label_version: int | None = None
+    labeler_model: str | None = None

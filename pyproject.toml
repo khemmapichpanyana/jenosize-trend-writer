@@ -34,17 +34,17 @@ dev = [
     "mypy>=1.13.0",
     "respx>=0.21.1",
     "types-boto3>=1.35.0",
+    "moto[server]>=5.0.0",      # S3-compatible stand-in for R2 in tests
 ]
 # The Modal CLI, for deploying/running the GPU jobs in `modal/`. A group, not a
 # runtime dependency, so it never reaches the Vercel bundle.
 modal = [
     "modal>=1.0",
 ]
-# Offline data-engineering extras that are NOT needed by the API at runtime.
+# The offline data pipeline. It writes straight to Postgres + R2, so it gets a
+# real Postgres driver; the API keeps supabase-py and never loads psycopg.
 pipeline = [
-    "beautifulsoup4>=4.12.3",
-    "lxml>=5.3.0",
-    "tqdm>=4.66.0",
+    "psycopg[binary]>=3.2.0",
 ]
 
 [build-system]

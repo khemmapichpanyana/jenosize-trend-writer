@@ -4,8 +4,8 @@ UV ?= uv
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-install:  ## Create the venv and install runtime + dev deps
-	$(UV) sync --group dev
+install:  ## Create the venv: runtime + dev + pipeline + Modal CLI
+	$(UV) sync --group dev --group pipeline --group modal
 
 dev:  ## Run the API locally with autoreload (mock provider, no cloud needed)
 	$(UV) run uvicorn app.main:app --reload --port 8000
@@ -30,34 +30,47 @@ smoke:  ## Smoke-test a running deployment: make smoke URL=https://...
 
 .PHONY: help install dev test lint fmt reqs smoke
 
-# --- data pipeline (Day 1) ---------------------------------------------------
-corpus:  ## Full corpus build: discover -> crawl -> clean -> stats
+# --- data pipeline: writes to Postgres (DATABASE_URL) + Cloudflare R2 ----------
+# Every target is incremental: re-running it only processes what changed.
+
+migrate:  ## Apply supabase/migrations/*.sql to DATABASE_URL
+	$(UV) run python -m pipeline.migrate up
+
+scrape:  ## Discover new URLs + crawl pages we don't have yet
 	$(UV) run python -m pipeline.scrape discover
 	$(UV) run python -m pipeline.scrape crawl
-	$(UV) run python -m pipeline.clean run
-	$(UV) run python -m pipeline.clean stats
 
-label:  ## Reverse-label the cleaned corpus (needs LABELER_* in .env)
+recheck:  ## Also re-fetch pages older than DAYS (default 30) to catch edits
+	$(UV) run python -m pipeline.scrape crawl --recheck-days $(or $(DAYS),30)
+
+clean:  ## Clean new/changed articles; flag near-duplicates
+	$(UV) run python -m pipeline.clean run
+
+label:  ## Reverse-label new/changed articles (needs LABELER_* in .env)
 	$(UV) run python -m pipeline.label run
 
-dataset:  ## Build and validate train/eval JSONL: make dataset VERSION=v1
-	$(UV) run python -m pipeline.build_dataset run --version $(or $(VERSION),v1)
-	$(UV) run python -m pipeline.build_dataset validate --version $(or $(VERSION),v1)
+corpus: scrape clean  ## scrape + clean, then show stats
+	$(UV) run python -m pipeline.clean stats
 
-corpus-status:  ## How far the corpus has progressed
+dataset:  ## Publish an immutable dataset version: make dataset VERSION=v1
+	$(UV) run python -m pipeline.build_dataset run --version $(or $(VERSION),v1)
+
+pipeline: scrape clean label  ## Everything up to (not including) publishing a dataset
+
+status:  ## Corpus progress per stage + recent pipeline runs
 	$(UV) run python -m pipeline.scrape status
 
-# --- GPU jobs (Day 2) --------------------------------------------------------
+# --- GPU jobs on Modal ------------------------------------------------------------
 modal-setup:  ## Authenticate the Modal CLI (opens a browser)
 	$(UV) run modal setup
 
-train:  ## Fine-tune on Modal: make train DATASET=r2://datasets/v1/train.jsonl
-	$(UV) run modal run modal/train.py --dataset-uri $(or $(DATASET),r2://datasets/v1/train.jsonl)
+train:  ## Fine-tune on Modal: make train VERSION=v1
+	$(UV) run modal run modal/train.py --dataset-uri r2://datasets/$(or $(VERSION),v1)/train.jsonl
 
 serve:  ## Deploy the vLLM server on Modal and print its URL
 	$(UV) run modal deploy modal/serve.py
 
-eval:  ## Base vs fine-tuned: make eval ENDPOINT=https://...modal.run/v1
-	$(UV) run modal run modal/eval.py --endpoint $(ENDPOINT)
+eval:  ## Base vs fine-tuned: make eval ENDPOINT=https://...modal.run/v1 VERSION=v1
+	$(UV) run modal run modal/eval.py --endpoint $(ENDPOINT) --briefs-uri r2://datasets/$(or $(VERSION),v1)/eval.jsonl
 
-.PHONY: corpus label dataset corpus-status modal-setup train serve eval
+.PHONY: migrate scrape recheck clean label corpus dataset pipeline status modal-setup train serve eval

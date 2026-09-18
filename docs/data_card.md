@@ -1,10 +1,8 @@
 # Data Card — Jenosize Trend Writer training corpus
 
-> **Status: template.** `python -m pipeline.build_dataset run` now renders the
-> real card, with actual counts and distributions, to
-> `.data/datasets/{version}/data_card.md` and to R2 as
-> `datasets/{version}/data_card.md`. Copy that file over this one once the
-> v1 dataset is final.
+> **Status: template.** `make dataset VERSION=v1` renders the real card, with
+> actual counts, distributions and the dataset fingerprint, and publishes it to
+> R2 as `datasets/v1/data_card.md`. Copy it over this file once v1 is final.
 
 ## Dataset summary
 

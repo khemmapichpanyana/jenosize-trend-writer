@@ -1,15 +1,21 @@
-"""Step 4 — emit the chat JSONL that `modal/train.py` consumes.
+"""Step 4 — publish a versioned chat-JSONL dataset to R2 for `modal/train.py`.
 
     uv run python -m pipeline.build_dataset run --version v1
     uv run python -m pipeline.build_dataset validate --version v1
+
+Dataset versions are IMMUTABLE. A model card that says "trained on v1" must mean
+the same bytes forever, so:
+  * same corpus, same version  -> nothing is written ("unchanged");
+  * changed corpus, same version -> refused; publish v2 instead
+    (`--overwrite` exists for iterating *before* anything was trained on it);
+  * rows are validated in memory first, and a broken dataset is never uploaded.
 
 CRITICAL INVARIANT — prompt parity
 ----------------------------------
 The training prompt is produced by `app.services.prompt.build_system_prompt` and
 `build_user_prompt`: the *same functions the API calls at inference time*. If
 this file grew its own template, the adapter would be optimised for a prompt the
-service never sends, and the fine-tune would silently underperform in a way no
-metric here would catch. `tests/test_pipeline_dataset.py` asserts the parity.
+service never sends. `tests/test_pipeline_dataset.py` asserts the parity.
 
 Output, one JSON object per line:
 
@@ -17,14 +23,12 @@ Output, one JSON object per line:
         {"role": "system",    "content": "<style rules + output contract>"},
         {"role": "user",      "content": "<rendered brief>"},
         {"role": "assistant", "content": "TITLE: …\\nMETA: …\\n---\\n<markdown>"}
-    ]}
-
-The assistant turn reproduces the output contract exactly, so the model learns
-to emit the format `app.services.llm.parse_article` already knows how to read.
+    ], "meta": {"url": …, "word_count": …}}
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -33,17 +37,23 @@ import typer
 from app.schemas.articles import TARGET_WORDS, NormalizedParams
 from app.services import prompt as prompt_service
 from app.services.llm import parse_article
-from app.storage import put_text
+from app.storage.base import Storage, put_text
 from app.storage.keys import dataset_key
-from pipeline._cli import context, run_async
+from pipeline._cli import echo_stats, pipeline_context, recorded_run, run_async
 from pipeline.schemas import Split, TrainingArticle
-from pipeline.store import split_for
+from pipeline.store import CorpusStore, split_for
 
-app = typer.Typer(help="Build train/eval JSONL from labelled articles.")
+app = typer.Typer(help="Publish versioned train/eval JSONL to R2.")
 
 # A meta description is part of the output contract, so a missing one has to be
 # synthesised rather than left blank — otherwise the model learns to skip it.
 META_FALLBACK_CHARS = 155
+# Rough character proxy for MAX_SEQ_LEN=4096 tokens in modal/train.py.
+MAX_EXAMPLE_CHARS = 14000
+
+
+class DatasetError(RuntimeError):
+    """Raised instead of publishing a dataset that is invalid or would mutate a version."""
 
 
 def params_for(article: TrainingArticle) -> NormalizedParams:
@@ -99,129 +109,174 @@ def eligible(articles: list[TrainingArticle]) -> list[TrainingArticle]:
     return [a for a in articles if a.labels and a.clean_markdown and a.title and not a.is_duplicate]
 
 
+def validate_rows(splits: dict[Split, list[dict[str, Any]]]) -> list[str]:
+    """Every defect that would waste a GPU run, as human-readable strings."""
+    problems: list[str] = []
+    urls: dict[Split, set[str]] = {"train": set(), "eval": set()}
+    for split, rows in splits.items():
+        for index, row in enumerate(rows, start=1):
+            where = f"{split}.jsonl:{index}"
+            messages = row.get("messages") or []
+            roles = [m.get("role") for m in messages]
+            if roles != ["system", "user", "assistant"]:
+                problems.append(f"{where}: roles are {roles}, expected system/user/assistant")
+                continue
+            if not messages[2].get("content", "").strip():
+                problems.append(f"{where}: empty assistant turn")
+            # The trained output must be parseable by the code that reads it in
+            # production.
+            title, meta, body = parse_article(messages[2]["content"])
+            if not title or title == "Untitled":
+                problems.append(f"{where}: assistant turn has no TITLE")
+            if not meta:
+                problems.append(f"{where}: assistant turn has no META")
+            if not (body.startswith("## ") or "\n## " in body):
+                problems.append(f"{where}: body has no '##' sections")
+            total = sum(len(m.get("content", "")) for m in messages)
+            if total > MAX_EXAMPLE_CHARS:
+                problems.append(f"{where}: {total} chars may exceed max_seq_len")
+            urls[split].add((row.get("meta") or {}).get("url", where))
+    if overlap := urls["train"] & urls["eval"]:
+        problems.append(
+            f"LEAKAGE: {len(overlap)} url(s) in both splits, e.g. {sorted(overlap)[:3]}"
+        )
+    if not splits["train"]:
+        problems.append("train split is empty")
+    return problems
+
+
+def jsonl(rows: list[dict[str, Any]]) -> str:
+    return "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+
+
+async def run_build(
+    store: CorpusStore,
+    storage: Storage,
+    *,
+    version: str,
+    eval_frac: float = 0.1,
+    seed: int = 13,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    articles = eligible(await store.usable())
+    if not articles:
+        raise DatasetError("no labelled articles — run scrape -> clean -> label first")
+
+    splits: dict[Split, list[dict[str, Any]]] = {"train": [], "eval": []}
+    assignment: dict[str, Split] = {}
+    for article in articles:
+        split = split_for(article.url, eval_frac, seed)
+        splits[split].append(to_example(article))
+        assignment[article.url] = split
+
+    if problems := validate_rows(splits):
+        raise DatasetError(
+            "dataset failed validation, nothing uploaded:\n  " + "\n  ".join(problems[:40])
+        )
+
+    bodies = {split: jsonl(rows) for split, rows in splits.items()}
+    digest = hashlib.sha256(f"{bodies['train']}\0{bodies['eval']}".encode()).hexdigest()
+    stats: dict[str, Any] = {
+        "version": version,
+        "train": len(splits["train"]),
+        "eval": len(splits["eval"]),
+        "fingerprint": digest[:12],
+    }
+
+    existing = await store.dataset_version(version)
+    if existing and existing["fingerprint"] == digest:
+        return {**stats, "status": "unchanged"}
+    if existing and not overwrite:
+        raise DatasetError(
+            f"dataset {version} already exists with different contents "
+            f"({existing['train_count']}+{existing['eval_count']} examples, created "
+            f"{existing['created_at']:%Y-%m-%d}). Versions are immutable: publish a new "
+            f"version (e.g. --version {_next_version(version)}), or pass --overwrite if "
+            f"nothing has been trained on {version} yet."
+        )
+
+    keys = {split: dataset_key(version, f"{split}.jsonl") for split in ("train", "eval")}
+    for split, body in bodies.items():
+        await put_text(storage, keys[split], body, content_type="application/jsonl")
+    card_key = dataset_key(version, "data_card.md")
+    card = render_data_card(version, articles, splits, eval_frac, seed, digest)
+    await put_text(storage, card_key, card, content_type="text/markdown; charset=utf-8")
+
+    await store.set_splits(assignment)
+    await store.record_dataset_version(
+        replace=bool(existing),
+        version=version,
+        fingerprint=digest,
+        train_count=len(splits["train"]),
+        eval_count=len(splits["eval"]),
+        train_key=keys["train"],
+        eval_key=keys["eval"],
+        card_key=card_key,
+        params={"eval_frac": eval_frac, "seed": seed},
+    )
+    return {
+        **stats,
+        "status": "overwritten" if existing else "published",
+        "train_key": keys["train"],
+    }
+
+
+def _next_version(version: str) -> str:
+    if version.startswith("v") and version[1:].isdigit():
+        return f"v{int(version[1:]) + 1}"
+    return f"{version}-2"
+
+
 @app.command()
 def run(
     version: str = "v1",
     eval_frac: float = typer.Option(0.1, help="Fraction held out for evaluation."),
     seed: int = 13,
-    out_dir: str = typer.Option(".data/datasets", help="Local output directory."),
-    upload: bool = typer.Option(True, help="Also write to object storage."),
+    overwrite: bool = typer.Option(False, help="Replace an existing version (only if untrained)."),
 ) -> None:
-    """Write `datasets/{version}/train.jsonl`, `eval.jsonl` and `data_card.md`."""
+    """Build, validate and publish `datasets/{version}/` to R2 — only if it changed."""
 
     async def _run() -> None:
-        from pathlib import Path
-
-        _, store, storage = context()
-        articles = eligible(await store.all())
-        if not articles:
-            typer.echo("no labelled articles — run scrape -> clean -> label first")
-            raise typer.Exit(code=1)
-
-        splits: dict[Split, list[dict[str, Any]]] = {"train": [], "eval": []}
-        assigned: list[TrainingArticle] = []
-        for article in articles:
-            split = split_for(article.url, eval_frac, seed)
-            splits[split].append(to_example(article))
-            assigned.append(article.merged(split=split))
-        await store.upsert_many(assigned)
-
-        local = Path(out_dir) / version
-        local.mkdir(parents=True, exist_ok=True)
-
-        for split, rows in splits.items():
-            body = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
-            path = local / f"{split}.jsonl"
-            path.write_text(body, encoding="utf-8")
-            if upload:
-                await put_text(
-                    storage,
-                    dataset_key(version, f"{split}.jsonl"),
-                    body,
-                    content_type="application/jsonl",
-                )
-            typer.echo(f"  {split}: {len(rows)} examples -> {path}")
-
-        card = render_data_card(version, assigned, splits, eval_frac, seed)
-        (local / "data_card.md").write_text(card, encoding="utf-8")
-        if upload:
-            await put_text(
-                storage, dataset_key(version, "data_card.md"), card, content_type="text/markdown"
-            )
-        typer.echo(f"  data card -> {local / 'data_card.md'}")
-        typer.echo(
-            f"\nnext: modal run modal/train.py --dataset-uri r2://{dataset_key(version, 'train.jsonl')}"
-        )
+        async with pipeline_context() as (_, store, storage):
+            try:
+                async with recorded_run(store, "build") as stats:
+                    stats.update(
+                        await run_build(
+                            store,
+                            storage,
+                            version=version,
+                            eval_frac=eval_frac,
+                            seed=seed,
+                            overwrite=overwrite,
+                        )
+                    )
+            except DatasetError as exc:
+                typer.echo(str(exc))
+                raise typer.Exit(code=1) from None
+            echo_stats("build", {k: v for k, v in stats.items() if k != "train_key"})
+            if stats["status"] != "unchanged":
+                typer.echo(f"\nnext: make train DATASET=r2://{stats['train_key']}")
 
     run_async(_run)
 
 
 @app.command()
-def validate(
-    version: str = "v1",
-    out_dir: str = ".data/datasets",
-    max_chars: int = typer.Option(14000, help="Rough proxy for the 4096-token limit."),
-) -> None:
-    """Catch dataset defects before a training run burns GPU time."""
+def validate(version: str = "v1") -> None:
+    """Re-validate a published version straight from R2."""
 
     async def _run() -> None:
-        from pathlib import Path
-
-        local = Path(out_dir) / version
-        problems: list[str] = []
-        urls: dict[str, set[str]] = {"train": set(), "eval": set()}
-
-        for split in ("train", "eval"):
-            path = local / f"{split}.jsonl"
-            if not path.exists():
-                problems.append(f"{split}.jsonl is missing — run `build_dataset run` first")
-                continue
-
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                if not line.strip():
-                    continue
-                where = f"{split}.jsonl:{lineno}"
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    problems.append(f"{where}: invalid JSON ({exc})")
-                    continue
-
-                messages = row.get("messages") or []
-                roles = [m.get("role") for m in messages]
-                if roles != ["system", "user", "assistant"]:
-                    problems.append(f"{where}: roles are {roles}, expected system/user/assistant")
-                    continue
-                if not messages[2].get("content", "").strip():
-                    problems.append(f"{where}: empty assistant turn")
-
-                # The trained output must be parseable by the code that will
-                # read it in production.
-                title, meta, body = parse_article(messages[2]["content"])
-                if not title or title == "Untitled":
-                    problems.append(f"{where}: assistant turn has no TITLE")
-                if not meta:
-                    problems.append(f"{where}: assistant turn has no META")
-                if body.count("\n## ") < 1:
-                    problems.append(f"{where}: body has no '##' sections")
-
-                total = sum(len(m.get("content", "")) for m in messages)
-                if total > max_chars:
-                    problems.append(f"{where}: {total} chars may exceed max_seq_len")
-
-                urls[split].add((row.get("meta") or {}).get("url", where))
-
-        if overlap := urls["train"] & urls["eval"]:
-            problems.append(
-                f"LEAKAGE: {len(overlap)} url(s) in both splits, e.g. {sorted(overlap)[:3]}"
-            )
-
-        typer.echo(f"train={len(urls['train'])}  eval={len(urls['eval'])}")
+        async with pipeline_context() as (_, _store, storage):
+            splits: dict[Split, list[dict[str, Any]]] = {"train": [], "eval": []}
+            for split in splits:
+                raw = await storage.get_bytes(dataset_key(version, f"{split}.jsonl"))
+                splits[split] = [
+                    json.loads(line) for line in raw.decode().splitlines() if line.strip()
+                ]
+        problems = validate_rows(splits)
+        typer.echo(f"train={len(splits['train'])}  eval={len(splits['eval'])}")
+        for problem in problems[:40]:
+            typer.echo(f"  ✗ {problem}")
         if problems:
-            for problem in problems[:40]:
-                typer.echo(f"  ✗ {problem}")
-            if len(problems) > 40:
-                typer.echo(f"  … and {len(problems) - 40} more")
             raise typer.Exit(code=1)
         typer.echo("  ✓ dataset looks good")
 
@@ -234,14 +289,16 @@ def render_data_card(
     splits: dict[Split, list[dict[str, Any]]],
     eval_frac: float,
     seed: int,
+    fingerprint: str,
 ) -> str:
-    """Fill docs/data_card.md's template with the real numbers."""
+    """Fill the data card with the real numbers for this version."""
     import statistics
     from datetime import UTC, datetime
 
     counts = [a.word_count for a in articles] or [0]
     by_category: dict[str, int] = {}
     by_industry: dict[str, int] = {}
+    models = sorted({a.labeler_model for a in articles if a.labeler_model})
     for article in articles:
         key = (article.labels.category if article.labels else None) or "unknown"
         by_category[key] = by_category.get(key, 0) + 1
@@ -263,28 +320,32 @@ Generated by `pipeline/build_dataset.py` on {datetime.now(UTC):%Y-%m-%d}.
 | Field | Value |
 |---|---|
 | Name | `jenosize-ideas-{version}` |
+| Fingerprint | `{fingerprint}` (sha256 of train.jsonl + eval.jsonl) |
 | Task | Conditional article generation (brief → Jenosize-style article) |
 | Size | {len(articles)} examples ({len(splits["train"])} train / {len(splits["eval"])} eval) |
 | Split | deterministic by sha256(url), eval_frac={eval_frac}, seed={seed} |
 | Format | JSONL, OpenAI chat messages |
 | Language | English |
+| Labeller | {", ".join(models) or "n/a"} |
 
 ## Provenance
 
-Public articles from Jenosize Ideas (`jenosize.com`), discovered via sitemap and
-crawled at ~1 req/s with robots.txt honoured. Raw HTML is archived to
-`raw/scrape/{{date}}/{{sha256}}.html` before any extraction.
+Public articles from Jenosize Ideas (`jenosize.com/en/ideas`), discovered via
+the sitemaps and crawled at ~1 req/s with robots.txt honoured. Raw HTML is
+archived in Cloudflare R2 under `raw/scrape/{{date}}/{{fingerprint}}.html`; rows
+live in Postgres (`training_articles`), with every run logged in `pipeline_runs`.
 
 ## Construction
 
-1. `pipeline/scrape.py` — sitemap discovery, polite crawl, raw archive.
-2. `pipeline/clean.py` — heading remap to `##`/`###`, boilerplate and CTA
-   removal, duplicate-title removal, {{300..4000}}-word filter, shingle-Jaccard
-   near-duplicate detection.
+1. `pipeline/scrape.py` — sitemap discovery; incremental crawl keyed on a
+   fingerprint of the extracted text (raw HTML changes per request on this site).
+2. `pipeline/clean.py` — heading remap to `##`/`###`, CTA and reference-section
+   removal, duplicate-title removal, 300-4000-word filter, shingle-Jaccard
+   near-duplicate flagging.
 3. `pipeline/label.py` — reverse-labelled briefs; category/language/length are
    derived, not inferred; inferred fields pass through the API's normalizers.
 4. `pipeline/build_dataset.py` — rendered through `app/services/prompt.py`, the
-   same functions the API calls at inference.
+   same functions the API calls at inference; validated before upload.
 
 ## Statistics
 
@@ -316,15 +377,16 @@ crawled at ~1 req/s with robots.txt honoured. Raw HTML is archived to
   retrieval, not the adapter, supplies evidence at inference time.
 * **No source-grounded examples.** Corpus articles were not written against
   supplied sources, so the training set contains no "Reference material" blocks.
-  The model's use of retrieved chunks is therefore carried by the base model and
-  the system prompt, not by the fine-tune — a known gap to evaluate.
-* **Recency.** Frozen at collection time; trend articles age.
+  Use of retrieved chunks is carried by the base model and the system prompt,
+  not by the fine-tune — a known gap to evaluate.
+* **Recency.** A snapshot at build time; trend articles age.
 
 ## Ethics
 
 No personal data. Author bylines and dates are stripped so the model cannot
-attribute text to a real person. The house call-to-action is removed so the model
-does not learn to advertise. Only the LoRA adapter is published, never the corpus.
+attribute text to a real person. The house call-to-action and reference lists
+are removed so the model neither advertises nor fabricates citations. Only the
+LoRA adapter is published, never the corpus.
 """
 
 

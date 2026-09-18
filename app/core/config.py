@@ -47,6 +47,9 @@ class Settings(BaseSettings):
 
     # --- persistence ---------------------------------------------------------
     persistence: Persistence = "none"
+    # Direct Postgres connection used by the data pipeline (psycopg). The API
+    # keeps using SUPABASE_URL + key; both can point at the same database.
+    database_url: str | None = None
     supabase_url: str | None = None
     supabase_secret_key: str | None = None
 
@@ -56,6 +59,9 @@ class Settings(BaseSettings):
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None
     r2_bucket: str = "jenosize-trend-writer"
+    # Optional override: point the S3 client at MinIO/moto for tests, or at a
+    # jurisdiction-specific R2 endpoint. Normally derived from R2_ACCOUNT_ID.
+    r2_endpoint: str | None = None
     local_storage_dir: str = ".data"
 
     # --- offline labeling (pipeline only, unused by the API) -----------------
@@ -77,6 +83,8 @@ class Settings(BaseSettings):
 
     @property
     def r2_endpoint_url(self) -> str | None:
+        if self.r2_endpoint:
+            return self.r2_endpoint
         if not self.r2_account_id:
             return None
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

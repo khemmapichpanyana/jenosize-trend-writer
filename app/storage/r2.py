@@ -24,7 +24,7 @@ class R2Storage:
         missing = [
             key
             for key, value in {
-                "R2_ACCOUNT_ID": settings.r2_account_id,
+                "R2_ACCOUNT_ID or R2_ENDPOINT": settings.r2_account_id or settings.r2_endpoint,
                 "R2_ACCESS_KEY_ID": settings.r2_access_key_id,
                 "R2_SECRET_ACCESS_KEY": settings.r2_secret_access_key,
             }.items()

@@ -52,3 +52,95 @@ def params() -> NormalizedParams:
         length="short",
         target_words=600,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline integration fixtures: real Postgres + an S3-compatible R2 stand-in.
+#
+# The pipeline's correctness lives in SQL predicates ("which rows changed?"), so
+# it is tested against a real Postgres rather than a mock. Set TEST_DATABASE_URL
+# to a *disposable* database (the fixture drops and recreates its public schema);
+# without it, these tests are skipped. CI provides one as a service container.
+# --------------------------------------------------------------------------- #
+
+import os  # noqa: E402
+import socket  # noqa: E402
+
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+
+
+@pytest.fixture(scope="session")
+def pg_dsn() -> str:
+    if not TEST_DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL not set; skipping Postgres integration tests")
+    import psycopg
+
+    from pipeline.migrate import apply_migrations
+
+    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
+        conn.execute("drop schema if exists public cascade")
+        conn.execute("create schema public")
+    apply_migrations(TEST_DATABASE_URL)
+    return TEST_DATABASE_URL
+
+
+@pytest.fixture
+async def corpus(pg_dsn: str):  # type: ignore[no-untyped-def]
+    import psycopg
+
+    from pipeline.store import connect
+
+    with psycopg.connect(pg_dsn, autocommit=True) as conn:
+        conn.execute("truncate training_articles, pipeline_runs, dataset_versions")
+    async with connect(pg_dsn) as store:
+        yield store
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.fixture(scope="session")
+def s3_endpoint():  # type: ignore[no-untyped-def]
+    from moto.server import ThreadedMotoServer
+
+    port = _free_port()
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
+    server.start()
+    yield f"http://127.0.0.1:{port}"
+    server.stop()
+
+
+@pytest.fixture
+def r2(s3_endpoint: str):  # type: ignore[no-untyped-def]
+    """A fresh, empty bucket behind the real R2Storage class."""
+    import uuid
+
+    import boto3
+
+    from app.storage.r2 import R2Storage
+
+    bucket = f"test-{uuid.uuid4().hex[:12]}"
+    boto3.client(
+        "s3",
+        endpoint_url=s3_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    ).create_bucket(Bucket=bucket)
+    return R2Storage(
+        Settings(
+            r2_endpoint=s3_endpoint,
+            r2_access_key_id="test",
+            r2_secret_access_key="test",
+            r2_bucket=bucket,
+        )
+    )
+
+
+def r2_keys(storage) -> list[str]:  # type: ignore[no-untyped-def]
+    """Every object key in the test bucket."""
+    response = storage._client.list_objects_v2(Bucket=storage._bucket)
+    return sorted(obj["Key"] for obj in response.get("Contents", []))

@@ -1,260 +1,367 @@
-"""Corpus store — where the pipeline keeps its work between CLI invocations.
+"""Corpus store: `training_articles` in Postgres, accessed with psycopg.
 
-The API's `Repository` is request-shaped (one generation at a time); the pipeline
-needs bulk scans and partial updates across four separate processes, so it gets
-its own seam with the same local-first philosophy:
+Why a direct Postgres connection rather than the Supabase REST client the API
+uses: the pipeline's hard problem is *incremental* work ("which rows changed
+since this stage last ran?"), and that is one SQL predicate per stage —
+`cleaned_hash is distinct from content_hash`. Expressing it over REST means
+fetching every row and filtering in Python. `DATABASE_URL` also works with any
+Postgres, not just Supabase.
 
-  * `PERSISTENCE=none`  -> SQLite at `.data/corpus.db`. Zero accounts, and the
-    stages are resumable because state survives the process.
-  * `PERSISTENCE=supabase` -> the `training_articles` table.
-
-SQLite rather than JSONL because every stage does "read the rows that still need
-work, update them by url", which is an index lookup, not a file rewrite.
+Every stage method either selects the rows that still need work or records a
+stage's result together with the fingerprint it was computed from. Nothing is
+ever deleted: failures are recorded in `error`, duplicates are flagged.
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
+from typing import Any
+from uuid import UUID
 
-import anyio
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
-from app.core.config import Settings
 from pipeline.schemas import ArticleLabels, Split, TrainingArticle
 
-# Columns shared by both backends. Kept explicit so a schema drift between
-# SQLite and Postgres shows up as a KeyError here rather than silent data loss.
-_FIELDS = (
-    "url",
-    "category_slug",
-    "title",
-    "meta_description",
-    "raw_key",
-    "content_hash",
-    "clean_markdown",
-    "word_count",
-    "is_duplicate",
-    "labels",
-    "split",
-    "error",
-    "fetched_at",
-)
+_COLUMNS = ", ".join(TrainingArticle.model_fields)
 
 
-@runtime_checkable
-class CorpusStore(Protocol):
-    name: str
-
-    async def upsert(self, article: TrainingArticle) -> None: ...
-
-    async def upsert_many(self, articles: list[TrainingArticle]) -> int: ...
-
-    async def get(self, url: str) -> TrainingArticle | None: ...
-
-    async def all(self) -> list[TrainingArticle]: ...
-
-    async def counts(self) -> dict[str, int]: ...
-
-
-def _to_row(article: TrainingArticle) -> dict[str, Any]:
-    row = article.model_dump(mode="json")
-    row["labels"] = json.dumps(row["labels"]) if row.get("labels") else None
-    return {key: row.get(key) for key in _FIELDS}
-
-
-def _from_row(row: dict[str, Any]) -> TrainingArticle:
-    data = dict(row)
-    labels = data.get("labels")
-    if isinstance(labels, str):
-        labels = json.loads(labels) if labels else None
-    data["labels"] = ArticleLabels.model_validate(labels) if labels else None
+def _article(row: dict[str, Any]) -> TrainingArticle:
+    data = {k: row.get(k) for k in TrainingArticle.model_fields}
+    data["labels"] = ArticleLabels.model_validate(row["labels"]) if row.get("labels") else None
+    data["split"] = data.get("split") or "train"
+    data["word_count"] = data.get("word_count") or 0
     data["is_duplicate"] = bool(data.get("is_duplicate"))
     return TrainingArticle.model_validate(data)
 
 
-class SqliteCorpusStore:
-    """Local, resumable corpus state."""
+class CorpusStore:
+    """Async Postgres access for the pipeline. Use via `connect()`."""
 
-    name = "sqlite"
+    def __init__(self, conn: psycopg.AsyncConnection[dict[str, Any]]) -> None:
+        self._conn = conn
 
-    def __init__(self, path: str = ".data/corpus.db") -> None:
-        self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+    # ------------------------------------------------------------- discover
 
-    @contextmanager
-    def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self._path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+    async def add_urls(self, articles: Iterable[TrainingArticle]) -> list[str]:
+        """Insert URLs not seen before; return only the new ones.
 
-    def _init_schema(self) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                """
-                create table if not exists articles (
-                    url              text primary key,
-                    category_slug    text,
-                    title            text,
-                    meta_description text,
-                    raw_key          text,
-                    content_hash     text,
-                    clean_markdown   text,
-                    word_count       integer default 0,
-                    is_duplicate     integer default 0,
-                    labels           text,
-                    split            text default 'train',
-                    error            text,
-                    fetched_at       text
-                )
-                """
-            )
-            conn.execute("create index if not exists articles_split on articles (split)")
-
-    def _upsert_sync(self, articles: list[TrainingArticle]) -> int:
-        rows = [_to_row(a) for a in articles]
-        columns = ", ".join(_FIELDS)
-        placeholders = ", ".join(f":{f}" for f in _FIELDS)
-        # Only overwrite a column when the new value is non-null, so a later
-        # stage re-running does not wipe an earlier stage's output.
-        updates = ", ".join(f"{f} = coalesce(excluded.{f}, articles.{f})" for f in _FIELDS[1:])
-        with self._conn() as conn:
-            conn.executemany(
-                f"insert into articles ({columns}) values ({placeholders}) "
-                f"on conflict(url) do update set {updates}",
+        Known URLs are left untouched: rediscovering an article is not news.
+        """
+        rows = [(a.url, a.category_slug) for a in articles]
+        if not rows:
+            return []
+        async with self._conn.cursor() as cur:
+            await cur.executemany(
+                "insert into training_articles (url, category_slug) values (%s, %s) "
+                "on conflict (url) do nothing returning url",
                 rows,
+                returning=True,
             )
-        return len(rows)
+            new: list[str] = []
+            while True:
+                if (row := await cur.fetchone()) is not None:
+                    new.append(row["url"])
+                if not cur.nextset():
+                    break
+        return new
 
-    async def upsert(self, article: TrainingArticle) -> None:
-        await anyio.to_thread.run_sync(self._upsert_sync, [article])
+    # ---------------------------------------------------------------- crawl
 
-    async def upsert_many(self, articles: list[TrainingArticle]) -> int:
-        if not articles:
-            return 0
-        return await anyio.to_thread.run_sync(self._upsert_sync, articles)
+    async def due_for_crawl(
+        self, *, limit: int, recheck_days: float | None
+    ) -> list[TrainingArticle]:
+        """Pages never successfully checked, plus stale ones if asked.
+
+        "Checked" is stamped on success and on *permanent* failures (a 4xx, or a
+        page with no article text), so those are not retried every run; a
+        transient failure (timeout, 5xx) leaves it unset and is retried next run.
+
+        Articles are rarely edited after publication, so re-checking known pages
+        is opt-in (`recheck_days`) rather than part of every run.
+        """
+        query = f"""
+            select {_COLUMNS} from training_articles
+            where last_checked_at is null
+               or (%(recheck)s::float is not null
+                   and last_checked_at < now() - make_interval(secs => %(recheck)s::float * 86400))
+            order by last_checked_at nulls first, url
+            limit %(limit)s
+        """
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, {"recheck": recheck_days, "limit": limit})
+            return [_article(r) for r in await cur.fetchall()]
+
+    async def current_hash(self, url: str) -> str | None:
+        async with self._conn.cursor() as cur:
+            await cur.execute("select content_hash from training_articles where url = %s", (url,))
+            row = await cur.fetchone()
+        return row["content_hash"] if row else None
+
+    async def mark_unchanged(self, url: str) -> None:
+        """Content identical to what we hold: note the check, write nothing else."""
+        await self._conn.execute(
+            "update training_articles set last_checked_at = now(), "
+            "fetch_count = fetch_count + 1, error = null where url = %s",
+            (url,),
+        )
+
+    async def record_content(
+        self,
+        url: str,
+        *,
+        content_hash: str,
+        r2_raw_key: str,
+        title: str | None,
+        meta_description: str | None,
+    ) -> None:
+        """New or changed content. Downstream stages notice via the fingerprint."""
+        await self._conn.execute(
+            """
+            update training_articles set
+                content_hash = %s, r2_raw_key = %s,
+                title = coalesce(%s, title), meta_description = coalesce(%s, meta_description),
+                last_checked_at = now(), content_changed_at = now(),
+                fetch_count = fetch_count + 1, error = null
+            where url = %s
+            """,
+            (content_hash, r2_raw_key, title, meta_description, url),
+        )
+
+    async def record_error(self, url: str, message: str, *, checked: bool = False) -> None:
+        # `checked` stamps last_checked_at so a permanently broken page is not
+        # retried at the head of every queue; transient errors leave it unset.
+        stamp = ", last_checked_at = now()" if checked else ""
+        await self._conn.execute(
+            f"update training_articles set error = %s{stamp} where url = %s",
+            (message[:500], url),
+        )
+
+    # ---------------------------------------------------------------- clean
+
+    async def due_for_clean(self, *, clean_version: int) -> list[TrainingArticle]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                select {_COLUMNS} from training_articles
+                where content_hash is not null
+                  and (cleaned_hash is distinct from content_hash
+                       or clean_version is distinct from %s)
+                order by url
+                """,
+                (clean_version,),
+            )
+            return [_article(r) for r in await cur.fetchall()]
+
+    async def record_clean(
+        self,
+        url: str,
+        *,
+        content_hash: str,
+        clean_version: int,
+        clean_markdown: str | None,
+        word_count: int,
+        error: str | None,
+    ) -> None:
+        """Store the cleaning result, including a rejection (markdown = null).
+
+        Recording rejections with their fingerprint means a too-short article
+        is not re-cleaned every run; it only comes back if its content changes
+        or the cleaning rules do.
+        """
+        await self._conn.execute(
+            """
+            update training_articles set
+                clean_markdown = %s, word_count = %s, error = %s,
+                cleaned_hash = %s, clean_version = %s
+            where url = %s
+            """,
+            (clean_markdown, word_count, error, content_hash, clean_version, url),
+        )
+
+    async def cleaned(self) -> list[TrainingArticle]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"select {_COLUMNS} from training_articles "
+                "where clean_markdown is not null order by first_seen_at, url"
+            )
+            return [_article(r) for r in await cur.fetchall()]
+
+    async def set_duplicates(self, duplicate_urls: set[str]) -> None:
+        """Flag exactly this set as duplicates (and clear stale flags)."""
+        await self._conn.execute(
+            "update training_articles set is_duplicate = (url = any(%s)) "
+            "where clean_markdown is not null",
+            (list(duplicate_urls),),
+        )
+
+    # ---------------------------------------------------------------- label
+
+    async def due_for_label(self, *, label_version: int) -> list[TrainingArticle]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                select {_COLUMNS} from training_articles
+                where clean_markdown is not null and not is_duplicate
+                  and (labelled_hash is distinct from cleaned_hash
+                       or label_version is distinct from %s)
+                order by url
+                """,
+                (label_version,),
+            )
+            return [_article(r) for r in await cur.fetchall()]
+
+    async def record_labels(
+        self,
+        url: str,
+        *,
+        labels: ArticleLabels,
+        labelled_hash: str,
+        label_version: int,
+        labeler_model: str,
+    ) -> None:
+        await self._conn.execute(
+            """
+            update training_articles set
+                labels = %s, labelled_hash = %s, label_version = %s,
+                labeler_model = %s, error = null
+            where url = %s
+            """,
+            (
+                Jsonb(labels.model_dump(mode="json")),
+                labelled_hash,
+                label_version,
+                labeler_model,
+                url,
+            ),
+        )
+
+    # ---------------------------------------------------------------- build
+
+    async def usable(self) -> list[TrainingArticle]:
+        """Rows that can become training examples right now."""
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                select {_COLUMNS} from training_articles
+                where labels is not null and clean_markdown is not null
+                  and title is not null and not is_duplicate
+                  and labelled_hash is not distinct from cleaned_hash
+                order by url
+                """
+            )
+            return [_article(r) for r in await cur.fetchall()]
+
+    async def set_splits(self, splits: dict[str, Split]) -> None:
+        async with self._conn.cursor() as cur:
+            await cur.executemany(
+                "update training_articles set split = %s where url = %s",
+                [(split, url) for url, split in splits.items()],
+            )
+
+    async def dataset_version(self, version: str) -> dict[str, Any] | None:
+        async with self._conn.cursor() as cur:
+            await cur.execute("select * from dataset_versions where version = %s", (version,))
+            return await cur.fetchone()
+
+    async def record_dataset_version(self, *, replace: bool = False, **fields: Any) -> None:
+        fields["params"] = Jsonb(fields.get("params") or {})
+        columns = ", ".join(fields)
+        placeholders = ", ".join(f"%({k})s" for k in fields)
+        conflict = ""
+        if replace:
+            updates = ", ".join(f"{k} = excluded.{k}" for k in fields if k != "version")
+            conflict = f" on conflict (version) do update set {updates}, created_at = now()"
+        await self._conn.execute(
+            f"insert into dataset_versions ({columns}) values ({placeholders}){conflict}",
+            fields,
+        )
+
+    # ----------------------------------------------------------- reporting
 
     async def get(self, url: str) -> TrainingArticle | None:
-        def _get() -> TrainingArticle | None:
-            with self._conn() as conn:
-                row = conn.execute("select * from articles where url = ?", (url,)).fetchone()
-            return _from_row(dict(row)) if row else None
-
-        return await anyio.to_thread.run_sync(_get)
+        async with self._conn.cursor() as cur:
+            await cur.execute(f"select {_COLUMNS} from training_articles where url = %s", (url,))
+            row = await cur.fetchone()
+        return _article(row) if row else None
 
     async def all(self) -> list[TrainingArticle]:
-        def _all() -> list[TrainingArticle]:
-            with self._conn() as conn:
-                rows = conn.execute("select * from articles order by url").fetchall()
-            return [_from_row(dict(r)) for r in rows]
+        async with self._conn.cursor() as cur:
+            await cur.execute(f"select {_COLUMNS} from training_articles order by url")
+            return [_article(r) for r in await cur.fetchall()]
 
-        return await anyio.to_thread.run_sync(_all)
-
-    async def counts(self) -> dict[str, int]:
-        def _counts() -> dict[str, int]:
-            with self._conn() as conn:
-                one = conn.execute(
-                    """
-                    select
-                      count(*)                                            as discovered,
-                      sum(case when raw_key is not null then 1 else 0 end)        as scraped,
-                      sum(case when clean_markdown is not null then 1 else 0 end) as cleaned,
-                      sum(case when labels is not null then 1 else 0 end)         as labelled,
-                      sum(case when is_duplicate then 1 else 0 end)               as duplicates,
-                      sum(case when error is not null then 1 else 0 end)          as errors
-                    from articles
-                    """
-                ).fetchone()
-            # sqlite3.Row iterates values, not column names, so .keys() is required.
-            return {k: int(one[k] or 0) for k in one.keys()}  # noqa: SIM118
-
-        return await anyio.to_thread.run_sync(_counts)
-
-
-class SupabaseCorpusStore:
-    """`training_articles` in Postgres — the shared, durable corpus."""
-
-    name = "supabase"
-
-    def __init__(self, settings: Settings) -> None:
-        from app.db.supabase_repo import SupabaseRepository
-
-        self._repo = SupabaseRepository(settings)
-
-    async def upsert(self, article: TrainingArticle) -> None:
-        await self.upsert_many([article])
-
-    async def upsert_many(self, articles: list[TrainingArticle]) -> int:
-        if not articles:
-            return 0
-        rows = []
-        for article in articles:
-            row = _to_row(article)
-            # Postgres holds `labels` as jsonb, so it takes the dict, not a string.
-            row["labels"] = article.labels.model_dump(mode="json") if article.labels else None
-            row["r2_raw_key"] = row.pop("raw_key")
-            rows.append(row)
-
-        def _upsert() -> None:
-            self._repo._client.table("training_articles").upsert(rows, on_conflict="url").execute()
-
-        await anyio.to_thread.run_sync(_upsert)
-        return len(rows)
-
-    async def get(self, url: str) -> TrainingArticle | None:
-        def _get() -> dict[str, Any] | None:
-            result = (
-                self._repo._client.table("training_articles")
-                .select("*")
-                .eq("url", url)
-                .limit(1)
-                .execute()
+    async def counts(self, *, clean_version: int, label_version: int) -> dict[str, int]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                """
+                select
+                  count(*)                                                    as discovered,
+                  count(*) filter (where content_hash is not null)            as fetched,
+                  count(*) filter (where clean_markdown is not null
+                                   and cleaned_hash = content_hash
+                                   and clean_version = %(cv)s)                as cleaned,
+                  count(*) filter (where labels is not null
+                                   and labelled_hash = cleaned_hash
+                                   and label_version = %(lv)s)                as labelled,
+                  count(*) filter (where is_duplicate)                        as duplicates,
+                  count(*) filter (where error is not null)                   as errors
+                from training_articles
+                """,
+                {"cv": clean_version, "lv": label_version},
             )
-            data = result.data or []
-            return data[0] if data else None
+            row = await cur.fetchone()
+        return {k: int(v or 0) for k, v in (row or {}).items()}
 
-        row = await anyio.to_thread.run_sync(_get)
-        return _from_row(_rename_pg(row)) if row else None
+    # ----------------------------------------------------------- run log
 
-    async def all(self) -> list[TrainingArticle]:
-        def _all() -> list[dict[str, Any]]:
-            result = self._repo._client.table("training_articles").select("*").execute()
-            return list(result.data or [])
+    async def start_run(self, stage: str) -> UUID:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "insert into pipeline_runs (stage) values (%s) returning id", (stage,)
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        return UUID(str(row["id"]))
 
-        return [_from_row(_rename_pg(row)) for row in await anyio.to_thread.run_sync(_all)]
+    async def finish_run(
+        self, run_id: UUID, *, stats: dict[str, Any], error: str | None = None
+    ) -> None:
+        await self._conn.execute(
+            "update pipeline_runs set status = %s, finished_at = now(), stats = %s, error = %s "
+            "where id = %s",
+            ("failed" if error else "succeeded", Jsonb(stats), error, run_id),
+        )
 
-    async def counts(self) -> dict[str, int]:
-        articles = await self.all()
-        return {
-            "discovered": len(articles),
-            "scraped": sum(1 for a in articles if a.raw_key),
-            "cleaned": sum(1 for a in articles if a.clean_markdown),
-            "labelled": sum(1 for a in articles if a.labels),
-            "duplicates": sum(1 for a in articles if a.is_duplicate),
-            "errors": sum(1 for a in articles if a.error),
-        }
-
-
-def _rename_pg(row: dict[str, Any]) -> dict[str, Any]:
-    """Postgres calls it `r2_raw_key`; the pipeline model calls it `raw_key`."""
-    out = {k: v for k, v in row.items() if k in {*_FIELDS, "r2_raw_key"}}
-    if "r2_raw_key" in out:
-        out["raw_key"] = out.pop("r2_raw_key")
-    return out
+    async def recent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "select stage, status, started_at, finished_at, stats, error "
+                "from pipeline_runs order by started_at desc limit %s",
+                (limit,),
+            )
+            return list(await cur.fetchall())
 
 
-def build_store(settings: Settings) -> CorpusStore:
-    if settings.persistence == "supabase":
-        return SupabaseCorpusStore(settings)
-    return SqliteCorpusStore(str(Path(settings.local_storage_dir) / "corpus.db"))
+@asynccontextmanager
+async def connect(dsn: str) -> AsyncIterator[CorpusStore]:
+    """Open one autocommitting connection for a CLI invocation.
+
+    Autocommit because each stage records progress row by row: a crash halfway
+    through a crawl must keep the pages already done, so the re-run resumes
+    rather than starts over.
+
+    `prepare_threshold=None` disables server-side prepared statements, which
+    Supabase's transaction pooler (and PgBouncer generally) cannot route.
+    """
+    conn = await psycopg.AsyncConnection.connect(
+        dsn, autocommit=True, row_factory=dict_row, prepare_threshold=None
+    )
+    try:
+        yield CorpusStore(conn)
+    finally:
+        await conn.close()
 
 
 def split_for(url: str, eval_frac: float, seed: int = 13) -> Split:

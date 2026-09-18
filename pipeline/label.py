@@ -32,8 +32,9 @@ from openai import AsyncOpenAI
 
 from app.core.logging import get_logger
 from app.services.normalize import normalize_industry, normalize_keywords, normalize_optional_text
-from pipeline._cli import context, run_async
+from pipeline._cli import echo_stats, pipeline_context, recorded_run, run_async
 from pipeline.schemas import ArticleLabels, TrainingArticle
+from pipeline.store import CorpusStore
 
 logger = get_logger(__name__)
 app = typer.Typer(help="Reverse-label cleaned articles into training briefs.")
@@ -67,6 +68,11 @@ Reply with a single JSON object and nothing else:
   "audience": "who the article addresses, e.g. 'Marketing leaders'",
   "keywords": ["3-8 lowercase SEO phrases that actually appear in the article"]
 }"""
+
+# Bump when LABELER_SYSTEM or build_labels changes meaning: every article is
+# then re-labelled on the next run. Labels are otherwise keyed on content only,
+# so a cleaning-rule tweak never re-bills the labelling LLM.
+LABEL_VERSION = 1
 
 # Enough article to characterise the brief without paying for the whole body.
 MAX_ARTICLE_CHARS = 6000
@@ -136,71 +142,83 @@ async def label_one(client: AsyncOpenAI, model: str, article: TrainingArticle) -
     return build_labels(parse_label_json(completion.choices[0].message.content or ""), article)
 
 
+async def run_label(
+    store: CorpusStore,
+    client: AsyncOpenAI,
+    model: str,
+    *,
+    limit: int = 1000,
+    concurrency: int = CONCURRENCY,
+) -> tuple[dict[str, int], list[TrainingArticle]]:
+    """Label only articles whose content changed since they were last labelled."""
+    pending = (await store.due_for_label(label_version=LABEL_VERSION))[:limit]
+    stats = {"pending": len(pending), "labelled": 0, "failed": 0}
+    done: list[TrainingArticle] = []
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _worker(article: TrainingArticle) -> None:
+        async with semaphore:
+            try:
+                labels = await label_one(client, model, article)
+            except Exception as exc:  # a single bad reply must not sink the run
+                stats["failed"] += 1
+                await store.record_error(article.url, f"label: {exc}")
+                logger.warning("label_failed", extra={"url": article.url, "error": str(exc)})
+                return
+            assert article.cleaned_hash is not None  # guaranteed by due_for_label
+            await store.record_labels(
+                article.url,
+                labels=labels,
+                labelled_hash=article.cleaned_hash,
+                label_version=LABEL_VERSION,
+                labeler_model=model,
+            )
+            stats["labelled"] += 1
+            done.append(article.model_copy(update={"labels": labels}))
+
+    async with asyncio.TaskGroup() as group:
+        for article in pending:
+            group.create_task(_worker(article))
+    return stats, done
+
+
+def labeler_client(base_url: str, api_key: str | None) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url=base_url.rstrip("/"), api_key=api_key or "not-needed", timeout=120.0
+    )
+
+
 @app.command()
 def run(
-    limit: int = typer.Option(500, help="Maximum articles to label this run."),
+    limit: int = typer.Option(1000, help="Maximum articles to label this run."),
     model: str | None = typer.Option(None, help="Overrides LABELER_MODEL."),
-    relabel: bool = typer.Option(False, help="Re-label articles that already have labels."),
     dry_run: bool = typer.Option(False, help="Label one article and print it; write nothing."),
 ) -> None:
-    """Infer a brief per article and store it."""
+    """Label new/changed articles (or all of them after a LABEL_VERSION bump)."""
 
     async def _run() -> None:
-        settings, store, _ = context()
-        labeler_model = model or settings.labeler_model
-        if not settings.labeler_base_url or not labeler_model:
-            typer.echo("set LABELER_BASE_URL, LABELER_API_KEY and LABELER_MODEL in .env first")
-            raise typer.Exit(code=1)
+        async with pipeline_context() as (settings, store, _):
+            labeler_model = model or settings.labeler_model
+            if not settings.labeler_base_url or not labeler_model:
+                typer.echo("set LABELER_BASE_URL, LABELER_API_KEY and LABELER_MODEL in .env first")
+                raise typer.Exit(code=1)
+            client = labeler_client(settings.labeler_base_url, settings.labeler_api_key)
 
-        articles = await store.all()
-        pending = [
-            a
-            for a in articles
-            if a.clean_markdown and not a.is_duplicate and (relabel or not a.labels)
-        ][: 1 if dry_run else limit]
+            if dry_run:
+                pending = await store.due_for_label(label_version=LABEL_VERSION)
+                if not pending:
+                    typer.echo("nothing to label")
+                    return
+                labels = await label_one(client, labeler_model, pending[0])
+                typer.echo(pending[0].url)
+                typer.echo(json.dumps(labels.model_dump(), indent=2))
+                typer.echo("(dry run; nothing written)")
+                return
 
-        if not pending:
-            typer.echo("nothing to label — run `clean run` first, or pass --relabel")
-            return
-
-        client = AsyncOpenAI(
-            base_url=settings.labeler_base_url.rstrip("/"),
-            api_key=settings.labeler_api_key or "not-needed",
-            timeout=120.0,
-        )
-
-        typer.echo(f"labelling {len(pending)} articles with {labeler_model}…")
-        semaphore = asyncio.Semaphore(CONCURRENCY)
-        done = failed = 0
-        results: list[TrainingArticle] = []
-
-        async def _worker(article: TrainingArticle) -> None:
-            nonlocal done, failed
-            async with semaphore:
-                try:
-                    labels = await label_one(client, labeler_model, article)
-                    results.append(article.merged(labels=labels, error=None))
-                    done += 1
-                except Exception as exc:  # a single bad reply must not sink the run
-                    failed += 1
-                    results.append(article.merged(error=f"label: {exc}"[:300]))
-                    logger.warning("label_failed", extra={"url": article.url, "error": str(exc)})
-
-        async with asyncio.TaskGroup() as group:
-            for article in pending:
-                group.create_task(_worker(article))
-
-        if dry_run:
-            for article in results:
-                typer.echo(f"\n{article.url}")
-                typer.echo(
-                    json.dumps(article.labels.model_dump() if article.labels else {}, indent=2)
-                )
-            typer.echo("\n(dry run; nothing written)")
-            return
-
-        await store.upsert_many(results)
-        typer.echo(f"labelled={done}  failed={failed}")
+            async with recorded_run(store, "label") as stats:
+                result, _ = await run_label(store, client, labeler_model, limit=limit)
+                stats.update(result, model=labeler_model)
+            echo_stats("label", stats)
 
     run_async(_run)
 
@@ -217,8 +235,8 @@ def audit(sample: int = 10, seed: int = 7) -> None:
         import random
         import textwrap
 
-        _, store, _ = context()
-        labelled = [a for a in await store.all() if a.labels]
+        async with pipeline_context() as (_, store, _):
+            labelled = [a for a in await store.all() if a.labels]
         if not labelled:
             typer.echo("no labelled articles yet")
             return

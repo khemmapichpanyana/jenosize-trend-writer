@@ -54,6 +54,12 @@ def test_explicit_database_url_wins(tmp_path: Path) -> None:
     assert s.database_url == "postgresql://u:p@h:5432/d"
 
 
+def test_db_url_is_used_as_given(tmp_path: Path) -> None:
+    url = f"postgresql://postgres:pw@db.{REF}.supabase.co:5432/postgres"
+    s = _settings(tmp_path, f"DB_URL={url}\nSUPABASE_URL={SUPABASE_URL}\nDB_PASSWORD=other\n")
+    assert s.database_url == url  # an explicit URL beats the derived one
+
+
 def test_no_database_url_without_a_password(tmp_path: Path) -> None:
     assert _settings(tmp_path, f"SUPABASE_URL={SUPABASE_URL}\n").database_url is None
 

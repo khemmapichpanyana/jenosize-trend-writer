@@ -54,10 +54,13 @@ class Settings(BaseSettings):
     # Server-side key (`sb_secret_…`); bypasses RLS, never sent to a browser.
     supabase_secret_key: str | None = None
 
-    # Direct Postgres connection used by the data pipeline (psycopg). Either set
-    # DATABASE_URL outright, or let it be built from SUPABASE_URL + DB_PASSWORD
-    # (+ DB_HOST) — see `_derive_database_url`.
-    database_url: str | None = None
+    # Postgres connection used by the data pipeline (psycopg). Set DB_URL (or
+    # DATABASE_URL) outright, or let it be built from SUPABASE_URL + DB_PASSWORD
+    # (+ DB_HOST) — see `_derive_database_url`. An explicit URL always wins.
+    database_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DB_URL", "DATABASE_URL", "database_url"),
+    )
     db_password: str | None = None
     # Supabase's direct host (db.<ref>.supabase.co) is IPv6-only on the free
     # plan; Modal containers and many networks are IPv4-only. Set DB_HOST to the

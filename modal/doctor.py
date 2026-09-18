@@ -33,7 +33,7 @@ def doctor() -> list[tuple[str, bool, str]]:
 
     settings = Settings()
     resolved = {
-        "database (DATABASE_URL, or SUPABASE_URL + DB_PASSWORD)": settings.database_url,
+        "database (DB_URL / DATABASE_URL, or SUPABASE_URL + DB_PASSWORD)": settings.database_url,
         "JOBS_API_KEY": settings.jobs_api_key,
         "R2 credentials": settings.r2_access_key_id and settings.r2_secret_access_key,
         "R2 endpoint (R2_API_ENDPOINT or R2_ACCOUNT_ID)": settings.r2_endpoint_url,

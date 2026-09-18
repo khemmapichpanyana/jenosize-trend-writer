@@ -33,8 +33,9 @@ SECRETS: dict[str, tuple[list[str], list[str]]] = {
         ["R2_ACCOUNT_ID", "R2_API_ENDPOINT", "R2_ENDPOINT", "R2_JENOSIZE_BUCKET", "R2_BUCKET"],
     ),
     "jeno-pipeline": (
-        ["DATABASE_URL|DB_PASSWORD", "JOBS_API_KEY"],
+        ["DB_URL|DATABASE_URL|DB_PASSWORD", "JOBS_API_KEY"],
         [
+            "DB_URL",
             "DATABASE_URL",
             "SUPABASE_URL",
             "DB_PASSWORD",
@@ -49,6 +50,37 @@ SECRETS: dict[str, tuple[list[str], list[str]]] = {
     "jeno-hf": (["HF_TOKEN"], []),
     "jeno-vllm": (["VLLM_API_KEY"], []),
 }
+
+
+def _database_keys_for_modal(env: dict[str, str], keys: list[str]) -> list[str]:
+    """Give Modal the IPv4-safe pooler connection, not a direct IPv6-only URL.
+
+    Locally DB_URL may point at db.<ref>.supabase.co, which resolves to IPv6
+    only. Whether Modal containers can reach IPv6 isn't documented, while the
+    session pooler works over IPv4 everywhere, so when the pooler pieces are
+    available they are sent instead of the direct URL (Settings rebuilds the
+    URL from SUPABASE_URL + DB_PASSWORD + DB_HOST inside the container).
+    """
+    direct = [
+        k
+        for k in ("DB_URL", "DATABASE_URL")
+        if k in env and ".supabase.co" in env[k] and "pooler.supabase.com" not in env[k]
+    ]
+    pooler_ready = all(
+        k in env for k in ("SUPABASE_URL", "DB_PASSWORD")
+    ) and "pooler.supabase.com" in env.get("DB_HOST", "")
+    if direct and pooler_ready:
+        print(
+            f"    note: jeno-pipeline gets the session pooler (DB_HOST), not "
+            f"{'/'.join(direct)} (the direct host is IPv6-only)"
+        )
+        return [k for k in keys if k not in direct]
+    if direct:
+        print(
+            f"    warning: {'/'.join(direct)} is the direct IPv6-only host; set DB_HOST to the "
+            "session pooler if `make modal-doctor` cannot reach Postgres"
+        )
+    return keys
 
 
 def main() -> int:
@@ -74,6 +106,8 @@ def main() -> int:
             {k for r in required for k in r.split("|") if k in env}
             | {k for k in optional if k in env}
         )
+        if name == "jeno-pipeline":
+            keys = _database_keys_for_modal(env, keys)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "secret.env"
             path.touch(mode=0o600)

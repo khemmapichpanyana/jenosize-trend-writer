@@ -33,7 +33,7 @@ def settings_or_exit() -> Settings:
     missing = [
         name
         for name, value in {
-            "DATABASE_URL": settings.database_url,
+            "DB_URL (or SUPABASE_URL + DB_PASSWORD)": settings.database_url,
             "R2_ACCOUNT_ID (or R2_ENDPOINT)": settings.r2_account_id or settings.r2_endpoint,
             "R2_ACCESS_KEY_ID": settings.r2_access_key_id,
             "R2_SECRET_ACCESS_KEY": settings.r2_secret_access_key,

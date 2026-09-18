@@ -35,6 +35,11 @@ dev = [
     "respx>=0.21.1",
     "types-boto3>=1.35.0",
 ]
+# The Modal CLI, for deploying/running the GPU jobs in `modal/`. A group, not a
+# runtime dependency, so it never reaches the Vercel bundle.
+modal = [
+    "modal>=1.0",
+]
 # Offline data-engineering extras that are NOT needed by the API at runtime.
 pipeline = [
     "beautifulsoup4>=4.12.3",

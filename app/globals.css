@@ -1,26 +1,71 @@
 @import "tailwindcss";
 
+/*
+  Console design tokens. Jenosize accent sampled from jenosize.com (#00bcce) is
+  used for brand moments; interactive and chart ink uses validated steps of the
+  same teal (#0a93a3 light / #0aa3b3 dark — pass the dataviz contrast,
+  lightness and chroma checks on their surfaces).
+*/
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --surface-0: #f4f6f7;
+  --surface-1: #ffffff;
+  --surface-2: #eef1f3;
+  --line: #dde3e7;
+  --grid: #e9edf0;
+  --text-primary: #14212b;
+  --text-secondary: #4b5b66;
+  --text-muted: #6b7a85;
+  --brand: #00bcce;
+  --accent: #0a93a3;
+  --accent-ink: #006f7a;
+  --accent-wash: rgba(10, 147, 163, 0.1);
+  --series-1: #0a93a3;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #0b1216;
+    --surface-1: #111b21;
+    --surface-2: #17242c;
+    --line: #22323c;
+    --grid: #1b2830;
+    --text-primary: #e8eef2;
+    --text-secondary: #b3c1ca;
+    --text-muted: #8a9aa5;
+    --accent: #0aa3b3;
+    --accent-ink: #5fdcea;
+    --accent-wash: rgba(10, 163, 179, 0.14);
+    --series-1: #0aa3b3;
+  }
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-ink: var(--text-primary);
+  --color-ink-2: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-brand: var(--brand);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-wash: var(--accent-wash);
+  --color-good: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+html, body { height: 100%; }
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
 }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

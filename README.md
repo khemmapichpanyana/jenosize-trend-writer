@@ -1,36 +1,89 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Jenosize AI Content — console
 
-## Getting Started
+The operator console for the Jenosize Trend Writer. From here you can:
+- pull and review the article corpus
+- fine-tune the model and **watch training live**, with the loss curve and GPU gauges
+- manage and evaluate the adapters
+- **chat with the content agent**: it writes with the fine-tuned model, lays the
+  article out as a Jenosize-branded page with your images, and you publish it to
+  a shareable link
 
-First, run the development server:
+All AI and data work happens in the Python backend (`../ai-services`: FastAPI,
+LangChain, Modal). This app is a thin, typed UI plus a server-side proxy.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+Browser ──► this app (Next.js 16)
+              ├─ pages: /, /data, /training, /runs/[id], /models, /studio, /content
+              ├─ /api/studio/*   proxy → studio API; adds the key, streams SSE through
+              └─ /p/[slug]       public share links (+ /p/assets/[id] images)
+                       │
+                       ▼
+            studio API on Modal (ai-services: pipeline/api + studio/)
+              ├─ LangChain agent: orchestrator on Modal vLLM, fallback LLM
+              │    └─ write_article → the fine-tuned jeno-lora (streams into the artifact panel)
+              ├─ jobs: scrape · label · datasets · train (L4) · eval · publish to HF
+              └─ Postgres (Supabase) + Cloudflare R2 (private bucket)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Run it
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm install
+cp .env.example .env.local     # STUDIO_API_URL, STUDIO_API_KEY (+ CONSOLE_PASSWORD in production)
+npm run dev                    # http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+**No accounts at all:** start the backend with its mocks, then point this app
+at it:
 
-## Learn More
+```bash
+# in ../ai-services (Postgres needed; see its README for a disposable local one)
+MODEL_PROVIDER=mock AGENT_PROVIDER=mock JOBS_API_KEY=dev make jobs-dev   # :8001
+# here
+STUDIO_API_URL=http://localhost:8001 STUDIO_API_KEY=dev npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+| Variable | Where | Purpose |
+|---|---|---|
+| `STUDIO_API_URL` | server | The studio API (`make deploy-modal` prints it) |
+| `STUDIO_API_KEY` | server | = `JOBS_API_KEY`. Never sent to the browser |
+| `CONSOLE_USER` / `CONSOLE_PASSWORD` | server | HTTP Basic auth for the console. **Required in production**, where the console refuses to serve without it; optional in dev |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Set `PUBLIC_SHARE_BASE_URL` on the backend to this app's public URL, so shared
+links point at `https://<console>/p/<slug>`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## What's where
 
-## Deploy on Vercel
+| Path | What it does |
+|---|---|
+| `proxy.ts` | Basic auth in front of everything except static assets and `/p/*` (Next 16's `proxy`, formerly middleware) |
+| `app/api/studio/[...path]/route.ts` | Backend-for-frontend proxy: adds `X-API-Key`, forwards only `/v1/*`, streams bodies both ways (uploads and SSE) |
+| `app/p/[slug]`, `app/p/assets/[id]` | Public share routes; the backend decides what is published |
+| `components/chat-workspace.tsx` | Chat plus artifact panel: live tokens, tool steps, the article streaming in, versions, preview, publish |
+| `components/run-live.tsx` | Live run view: SSE with resume (`after_id`), loss and learning-rate charts, GPU meters, ETA, cancel |
+| `components/line-chart.tsx` | Hand-built SVG line chart (no chart library) |
+| `lib/sse.ts` | SSE over `fetch`, because `EventSource` can't POST, and chat needs POST |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Design notes
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Charts follow a validated spec.** The series colour is a teal step of the
+  Jenosize brand accent (`#0a93a3` light, `#0aa3b3` dark), checked for contrast,
+  lightness and chroma on each surface. The brand's own `#00bcce` is only 2.3:1
+  on white, so it's used for brand moments, not data. Charts have one axis, a
+  2px line, an end label, a crosshair that also works by keyboard, and a table
+  view. Status colours are reserved and always paired with an icon and label.
+- **Agent output is untrusted.** The backend sanitises page HTML to an
+  allowlist, and published pages carry a no-script CSP. The preview iframe
+  allows no scripts (`allow-same-origin` only, so preview images load through
+  the authenticated proxy).
+- **Publishing is a person's decision.** The agent can write and design, but
+  only the Publish button makes a page public.
+- **Brand context is a placeholder.** Edit `ai-services/studio/brand/jenosize.md`
+  (voice and layout rules the agent follows) and `theme.css` (colours and type)
+  once the official guidelines are available.
+
+## Checks
+
+```bash
+npm run lint && npm run build
+```

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import quote, urlparse
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 ModelProvider = Literal["mock", "openai_compatible"]
 Persistence = Literal["none", "supabase"]
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
         # MODEL_PROVIDER / MODEL_BASE_URL because those names read better in the
         # deployment dashboards, so the protection is disabled here.
         protected_namespaces=(),
+        # Fields with env aliases (below) can still be set by field name in code.
+        populate_by_name=True,
     )
 
     # --- app -----------------------------------------------------------------
@@ -47,21 +50,39 @@ class Settings(BaseSettings):
 
     # --- persistence ---------------------------------------------------------
     persistence: Persistence = "none"
-    # Direct Postgres connection used by the data pipeline (psycopg). The API
-    # keeps using SUPABASE_URL + key; both can point at the same database.
-    database_url: str | None = None
     supabase_url: str | None = None
+    # Server-side key (`sb_secret_…`); bypasses RLS, never sent to a browser.
     supabase_secret_key: str | None = None
+
+    # Direct Postgres connection used by the data pipeline (psycopg). Either set
+    # DATABASE_URL outright, or let it be built from SUPABASE_URL + DB_PASSWORD
+    # (+ DB_HOST) — see `_derive_database_url`.
+    database_url: str | None = None
+    db_password: str | None = None
+    # Supabase's direct host (db.<ref>.supabase.co) is IPv6-only on the free
+    # plan; Modal containers and many networks are IPv4-only. Set DB_HOST to the
+    # project's *session pooler* (Dashboard -> Connect -> Session pooler), e.g.
+    # aws-0-ap-northeast-2.pooler.supabase.com, to work everywhere.
+    db_host: str | None = None
+    db_port: int = 5432
+    db_name: str = "postgres"
+    db_user: str | None = None
 
     # --- storage -------------------------------------------------------------
     storage: StorageBackend = "local"
     r2_account_id: str | None = None
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None
-    r2_bucket: str = "jenosize-trend-writer"
-    # Optional override: point the S3 client at MinIO/moto for tests, or at a
-    # jurisdiction-specific R2 endpoint. Normally derived from R2_ACCOUNT_ID.
-    r2_endpoint: str | None = None
+    r2_bucket: str = Field(
+        default="jenosize-trend-writer",
+        validation_alias=AliasChoices("R2_JENOSIZE_BUCKET", "R2_BUCKET", "r2_bucket"),
+    )
+    # The S3 API endpoint. Cloudflare shows it as "S3 API" on the bucket page;
+    # derived from R2_ACCOUNT_ID when unset. Also how tests point at moto.
+    r2_endpoint: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("R2_API_ENDPOINT", "R2_ENDPOINT", "r2_endpoint"),
+    )
     local_storage_dir: str = ".data"
 
     # --- jobs API (modal/jobs.py) ------------------------------------------
@@ -78,6 +99,27 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 10 * 1024 * 1024
     retrieval_top_k: int = 6
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """This project's `.env` beats variables exported in the shell.
+
+        The pydantic default is the reverse, which is right for deployments but
+        dangerous on a laptop: generic names such as R2_BUCKET or
+        R2_ACCESS_KEY_ID exported globally for another project would silently
+        redirect this service's writes into that project's bucket. (Observed:
+        a shell-exported R2_BUCKET for a different app won over this repo's
+        .env.) Vercel and Modal have no `.env` file, so there the real
+        environment still applies.
+        """
+        return init_settings, dotenv_settings, env_settings, file_secret_settings
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
@@ -86,10 +128,34 @@ class Settings(BaseSettings):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 
+    @model_validator(mode="after")
+    def _derive_database_url(self) -> Settings:
+        """Build DATABASE_URL from the Supabase pieces when it isn't given.
+
+        The password is percent-encoded: a raw '@' or '/' in it would otherwise
+        silently change the host the URL points at. The pooler requires the
+        user to be `postgres.<project-ref>`; the direct host wants `postgres`.
+        """
+        if self.database_url or not (self.supabase_url and self.db_password):
+            return self
+        ref = (urlparse(self.supabase_url).hostname or "").split(".")[0]
+        if not ref:
+            return self
+        host = self.db_host or f"db.{ref}.supabase.co"
+        user = self.db_user or (f"postgres.{ref}" if "pooler.supabase.com" in host else "postgres")
+        self.database_url = (
+            f"postgresql://{quote(user, safe='')}:{quote(self.db_password, safe='')}"
+            f"@{host}:{self.db_port}/{self.db_name}?sslmode=require"
+        )
+        return self
+
     @property
     def r2_endpoint_url(self) -> str | None:
         if self.r2_endpoint:
-            return self.r2_endpoint
+            # Cloudflare's dashboard sometimes shows the endpoint with the
+            # bucket appended; boto3 wants the bare origin.
+            parsed = urlparse(self.r2_endpoint)
+            return f"{parsed.scheme}://{parsed.netloc}"
         if not self.r2_account_id:
             return None
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

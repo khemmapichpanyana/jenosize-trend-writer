@@ -16,6 +16,11 @@ from app.core.config import Settings
 from app.main import create_app
 from app.schemas.articles import NormalizedParams
 
+# Tests must never read a developer's real .env: it now outranks the process
+# environment and holds live credentials, so a test that forgot to pass a field
+# explicitly could otherwise talk to production Supabase or R2.
+Settings.model_config["env_file"] = None
+
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:

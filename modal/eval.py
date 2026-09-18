@@ -23,7 +23,7 @@ import os
 import random
 from typing import Any
 
-from common import BASE_MODEL, MINUTES, app, app_image, r2_secret, vllm_secret
+from common import BASE_MODEL, MINUTES, app, app_image, r2_client, r2_secret, vllm_secret
 
 # Held-out briefs. `--briefs-uri r2://datasets/v1/eval.jsonl` replaces these with
 # the real held-out split; these three keep the harness runnable before then.
@@ -72,16 +72,8 @@ def _load_briefs(uri: str | None) -> list[dict[str, Any]]:
     if not uri:
         return FALLBACK_BRIEFS
     if uri.startswith("r2://"):
-        import boto3
-
-        client = boto3.client(
-            "s3",
-            endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-            region_name="auto",
-        )
-        body = client.get_object(Bucket=os.environ["R2_BUCKET"], Key=uri[5:])["Body"].read()
+        client, bucket = r2_client()
+        body = client.get_object(Bucket=bucket, Key=uri[5:])["Body"].read()
         lines = body.decode().splitlines()
     else:
         with open(uri) as fh:
@@ -308,17 +300,10 @@ def _summarise(run_name: str, results: list[dict[str, Any]]) -> dict[str, Any]:
 def _upload_results(run_name: str, payload: dict[str, Any]) -> None:
     import uuid
 
-    import boto3
-
     run_id = f"{run_name}-{uuid.uuid4().hex[:8]}"
-    boto3.client(
-        "s3",
-        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
-    ).put_object(
-        Bucket=os.environ["R2_BUCKET"],
+    client, bucket = r2_client()
+    client.put_object(
+        Bucket=bucket,
         Key=f"eval/{run_id}/results.json",
         Body=json.dumps(payload, indent=2).encode(),
         ContentType="application/json",

@@ -27,6 +27,7 @@ from common import (
     app,
     hf_secret,
     models_volume,
+    r2_client,
     r2_secret,
     train_image,
 )
@@ -70,17 +71,8 @@ CHECKPOINT_DIR = "/models/checkpoints"
 def _load_jsonl(uri: str) -> list[dict]:
     """Load the training set from R2 (`r2://key`) or a path inside the container."""
     if uri.startswith("r2://"):
-        import boto3
-
-        key = uri[len("r2://") :]
-        client = boto3.client(
-            "s3",
-            endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-            region_name="auto",
-        )
-        body = client.get_object(Bucket=os.environ["R2_BUCKET"], Key=key)["Body"].read()
+        client, bucket = r2_client()
+        body = client.get_object(Bucket=bucket, Key=uri[len("r2://") :])["Body"].read()
         lines = body.decode().splitlines()
     else:
         with open(uri) as fh:

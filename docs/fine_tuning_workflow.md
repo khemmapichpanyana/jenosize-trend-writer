@@ -47,17 +47,23 @@ done), R2 holds *bytes* (raw pages, published datasets), Modal holds *GPU work*.
 
 | Service | What to create | Goes into |
 |---|---|---|
-| Supabase | A project (region: Singapore). Dashboard → **Connect** → *Session pooler* URI | `.env` → `DATABASE_URL` |
-| Cloudflare R2 | Bucket `jenosize-trend-writer` (public access off) + an API token scoped to it, *Object Read & Write* | `.env` → `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` |
+| Supabase | A project. Settings → Database password; Connect → *Session pooler* host | `.env` → `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `DB_PASSWORD`, `DB_HOST` |
+| Cloudflare R2 | A bucket (**public access off**) + an API token scoped to it, *Object Read & Write* | `.env` → `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_API_ENDPOINT`, `R2_JENOSIZE_BUCKET` |
 | Any OpenAI-compatible LLM | For reverse-labelling (~150 short calls) | `.env` → `LABELER_BASE_URL`, `LABELER_API_KEY`, `LABELER_MODEL` |
 | Hugging Face | A token with *write* access (to publish the adapter) | Modal secret `jeno-hf` |
 | Modal | `uv run modal setup` (browser login) | `~/.modal.toml` |
 | Jobs API key | `openssl rand -hex 24` | Modal secret `jeno-pipeline` → `JOBS_API_KEY` |
 
-Use Supabase's **Session pooler** URI rather than the direct connection. On the
-free plan the direct host is IPv6-only, and many home and office networks
-aren't. The code disables prepared statements, so the Transaction pooler
-(port 6543) also works.
+`DATABASE_URL` is built for you from `SUPABASE_URL` + `DB_PASSWORD` + `DB_HOST`,
+with the password percent-encoded, or you can set it outright. Set `DB_HOST` to
+the **session pooler** host (for this project:
+`aws-0-ap-northeast-2.pooler.supabase.com`, which is Seoul). The direct
+`db.<ref>.supabase.co` host is IPv6-only, and Modal needs IPv4.
+
+**Precedence:** this repo's `.env` beats variables exported in your shell. A
+global `export R2_BUCKET=…` for another project in `~/.zshrc` would otherwise
+silently redirect this pipeline's writes into that project's bucket. This was
+observed and is covered by `tests/test_config.py`.
 
 ### Install and migrate
 
@@ -69,14 +75,15 @@ make migrate                                          # creates all tables (idem
 
 ### Modal secrets (jobs on Modal read these, not your `.env`)
 
+Add `JOBS_API_KEY`, `HF_TOKEN` and `VLLM_API_KEY` to `.env`, then:
+
 ```bash
-uv run modal secret create jeno-hf       HF_TOKEN=hf_...
-uv run modal secret create jeno-vllm     VLLM_API_KEY=$(openssl rand -hex 24)
-uv run modal secret create jeno-r2       R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... \
-                                         R2_SECRET_ACCESS_KEY=... R2_BUCKET=jenosize-trend-writer
-uv run modal secret create jeno-pipeline DATABASE_URL=postgresql://... JOBS_API_KEY=... \
-                                         LABELER_BASE_URL=... LABELER_API_KEY=... LABELER_MODEL=...
+make modal-secrets
 ```
+
+That creates `jeno-r2`, `jeno-pipeline`, `jeno-hf` and `jeno-vllm` from `.env`.
+Each secret gets only the keys its functions need, and values are never printed
+or passed on the command line. Re-run it whenever `.env` changes.
 
 ### Check, then deploy
 

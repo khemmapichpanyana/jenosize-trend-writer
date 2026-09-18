@@ -29,31 +29,28 @@ def doctor() -> list[tuple[str, bool, str]]:
     for module in ("common", "app.main", "pipeline.api", "pipeline.jobs"):
         check(f"import {module}", lambda m=module: importlib.import_module(m) and "ok")
 
-    for var in (
-        "DATABASE_URL",
-        "JOBS_API_KEY",
-        "R2_ACCESS_KEY_ID",
-        "R2_SECRET_ACCESS_KEY",
-        "R2_BUCKET",
-    ):
-        check(
-            f"env {var}",
-            lambda v=var: "set" if os.environ.get(v) else (_ for _ in ()).throw(KeyError(v)),
-        )
+    from app.core.config import Settings
+
+    settings = Settings()
+    resolved = {
+        "database (DATABASE_URL, or SUPABASE_URL + DB_PASSWORD)": settings.database_url,
+        "JOBS_API_KEY": settings.jobs_api_key,
+        "R2 credentials": settings.r2_access_key_id and settings.r2_secret_access_key,
+        "R2 endpoint (R2_API_ENDPOINT or R2_ACCOUNT_ID)": settings.r2_endpoint_url,
+    }
+    for label, value in resolved.items():
+        checks.append((f"config {label}", bool(value), "set" if value else "missing"))
     for var in ("LABELER_BASE_URL", "LABELER_MODEL"):
+        present = bool(os.environ.get(var))
         checks.append(
-            (
-                f"env {var} (needed for labelling)",
-                bool(os.environ.get(var)),
-                "set" if os.environ.get(var) else "missing",
-            )
+            (f"env {var} (needed for labelling)", present, "set" if present else "missing")
         )
 
     def postgres() -> str:
         import psycopg
 
         with psycopg.connect(
-            os.environ["DATABASE_URL"], prepare_threshold=None, connect_timeout=10
+            settings.database_url or "", prepare_threshold=None, connect_timeout=10
         ) as conn:
             applied = [
                 r[0] for r in conn.execute("select version from schema_migrations order by 1")
@@ -61,12 +58,11 @@ def doctor() -> list[tuple[str, bool, str]]:
         return f"migrations applied: {', '.join(applied)}"
 
     def r2() -> str:
-        from app.core.config import Settings
         from app.storage.r2 import R2Storage
 
-        storage = R2Storage(Settings())
-        storage._client.head_bucket(Bucket=storage._bucket)
-        return f"bucket {storage._bucket} reachable"
+        storage = R2Storage(settings)
+        storage._client.head_bucket(Bucket=settings.r2_bucket)
+        return f"bucket {settings.r2_bucket} reachable"
 
     check("postgres", postgres)
     check("r2", r2)

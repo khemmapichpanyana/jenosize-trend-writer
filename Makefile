@@ -64,6 +64,9 @@ status:  ## Corpus progress per stage + recent pipeline runs
 modal-setup:  ## Authenticate the Modal CLI (opens a browser)
 	$(UV) run modal setup
 
+modal-secrets:  ## Create/update the Modal secrets from .env (least privilege, values never printed)
+	$(UV) run python scripts/modal_secrets.py
+
 modal-doctor:  ## Check secrets, Postgres, R2 and imports from inside Modal (~1 cent)
 	$(UV) run modal run modal/doctor.py
 
@@ -79,4 +82,4 @@ train:  ## Fine-tune from the CLI (the jobs API does the same): make train VERSI
 eval:  ## Base vs fine-tuned from the CLI: make eval ENDPOINT=https://...modal.run/v1 VERSION=v1
 	$(UV) run modal run modal/eval.py --endpoint $(ENDPOINT) --briefs-uri r2://datasets/$(or $(VERSION),v1)/eval.jsonl
 
-.PHONY: migrate scrape recheck clean label corpus dataset pipeline status modal-setup modal-doctor deploy-modal jobs-dev train eval
+.PHONY: migrate scrape recheck clean label corpus dataset pipeline status modal-setup modal-secrets modal-doctor deploy-modal jobs-dev train eval

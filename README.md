@@ -232,6 +232,25 @@ re-run touches only what changed.
 | **dataset** | Rendered through `app/services/prompt.py`, byte-identical to inference (enforced by a test). Validated before upload. **Versions are immutable.** |
 | **serve** | Every trained version is served by name (`jeno-lora-v1`, …) plus the `jeno-lora` alias for the active one. |
 
+## Studio: the content agent
+
+A LangChain 1.x agent (`studio/`) served with the jobs API, used from the
+console in `../jenosize-ai-content-web`.
+
+| Piece | What it does |
+|---|---|
+| Orchestrator | `AGENT_MODEL` (base Qwen) on the same Modal vLLM server, with an optional fallback LLM (`ModelFallbackMiddleware`). Model and tool call limits cap runaway turns |
+| `write_article` | Always the **fine-tuned `jeno-lora`**, through the same `GenerationService` as the article API. Its tokens stream live into the artifact panel |
+| `design_page` | Lays the article out as a branded page using `studio/brand/` (placeholder brand context plus a theme). Output is sanitised to an allowlist; invented images or dropped content fall back to the standard layout |
+| Artifacts | Immutable versions (markdown plus page HTML) |
+| Assets | Images are decoded before storing, and stay private in R2 |
+| Publish | A person's action: freezes a version at `/p/{slug}` with a no-script CSP; only the images that page references become public |
+| Live training | The GPU job writes per-step loss and NVML GPU telemetry; `GET /v1/runs/{id}/events` streams it; `GET /v1/resources` shows Modal containers |
+
+Run it locally with no accounts: `MODEL_PROVIDER=mock AGENT_PROVIDER=mock`. The
+mock agent drives the real tools, streaming and publishing, and says it's a mock
+in its replies.
+
 ---
 
 ## Deployment

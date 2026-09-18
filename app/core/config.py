@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     # is trained on the article output format, not on tool calling. The writing
     # itself goes through the fine-tuned model (MODEL_NAME) via write_article.
     agent_model: str = "Qwen/Qwen3-4B-Instruct-2507"
+    # "mock": a deterministic stand-in that drives the real tools, for local
+    # demos and tests without a GPU or LLM account (like MODEL_PROVIDER=mock).
+    agent_provider: Literal["auto", "mock"] = "auto"
     # Optional fallback when the GPU is cold or down (any OpenAI-compatible
     # endpoint). Defaults to the labelling LLM when unset.
     agent_fallback_base_url: str | None = None

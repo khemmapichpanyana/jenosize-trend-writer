@@ -564,3 +564,17 @@ async def test_a_streaming_model_can_call_tools(
         events = await chat(client, thread["id"], "write it")
     assert [p["name"] for n, p in events if n == "tool_start"] == ["write_article", "design_page"]
     assert next(p for n, p in events if n == "message")["content"].startswith("Drafted")
+
+
+async def test_mock_agent_runs_the_studio_without_any_model_account(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    settings = studio_settings.model_copy(update={"agent_provider": "mock"})
+    app = create_jobs_app(InlineDispatcher(settings, r2), settings, r2)  # the real factory
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
+        thread_id, image_id = await new_thread_with_image(client)
+        events = await chat(client, thread_id, "Agentic AI in retail", [image_id])
+    assert [p["name"] for n, p in events if n == "tool_start"] == ["write_article", "design_page"]
+    design = next(p for n, p in events if n == "tool_end" and p["name"] == "design_page")["result"]
+    assert design["images_used"] == 1  # the attached image made it onto the page
+    assert next(p for n, p in events if n == "message")["content"].startswith("(mock agent)")

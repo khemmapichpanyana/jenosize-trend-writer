@@ -41,6 +41,10 @@ def _chat(base_url: str, api_key: str | None, model: str, *, timeout: float) -> 
 
 
 def build_agent_models(settings: Settings) -> AgentModels:
+    if settings.agent_provider == "mock":
+        from studio.mock_agent import MockAgentModel
+
+        return AgentModels(primary=MockAgentModel(), names=["mock-agent"])
     candidates: list[tuple[str, ChatOpenAI]] = []
     if settings.model_provider == "openai_compatible" and settings.model_base_url:
         candidates.append(

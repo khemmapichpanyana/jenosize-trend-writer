@@ -8,10 +8,12 @@ those pages reference.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import re
+import time
 import unicodedata
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -20,7 +22,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
@@ -31,12 +33,10 @@ from app.services.generation import GenerationService
 from app.services.llm import build_provider
 from app.storage.base import Storage, put_text
 from app.storage.keys import safe_filename
-from pipeline.api.deps import GUARDED, SettingsDep, StorageDep
+from pipeline.api.deps import GUARDED, DispatcherDep, SettingsDep, StorageDep
 from studio import html as page
-from studio.agent import build_agent, run_turn
 from studio.llm import AgentModels, NoAgentModelError
-from studio.store import StudioStore
-from studio.tools import ToolContext, build_tools
+from studio.store import ACTIVE_RUN, ActiveRunExists, StudioStore
 
 router = APIRouter(prefix="/v1/studio", tags=["studio"], dependencies=GUARDED)
 public = APIRouter(tags=["public"])
@@ -46,6 +46,8 @@ MAX_IMAGE_PIXELS = 40_000_000
 IMAGE_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp", "GIF": "image/gif"}
 SSE_HEADERS = {"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"}
 SLUG_MAX = 80
+EVENT_POLL_S = 0.4
+HEARTBEAT_S = 15.0
 
 
 # ------------------------------------------------------------------ plumbing
@@ -125,7 +127,7 @@ async def list_threads(
 
 
 @router.get("/threads/{thread_id}")
-async def get_thread(thread_id: UUID, store: StoreDep) -> dict[str, Any]:
+async def get_thread(thread_id: UUID, request: Request, store: StoreDep) -> dict[str, Any]:
     thread = await store.get_thread(thread_id)
     if thread is None:
         raise NotFoundError(f"no chat {thread_id}")
@@ -138,11 +140,15 @@ async def get_thread(thread_id: UUID, store: StoreDep) -> dict[str, Any]:
                 "published": await store.published_for_artifact(artifact["id"]),
             }
         )
+    active = await store.active_run(thread_id)
     return {
         **thread,
         "messages": await store.list_messages(thread_id),
         "artifacts": artifacts,
         "assets": [_asset_view(a) for a in await store.list_assets(thread_id)],
+        # A turn still running (e.g. the page was reloaded mid-turn): the console
+        # re-attaches to its event stream from the start and replays it.
+        "active_run": await _reconcile(request, store, active) if active else None,
     }
 
 
@@ -152,55 +158,137 @@ async def delete_thread(thread_id: UUID, store: StoreDep) -> Response:
     return Response(status_code=204)
 
 
-@router.post("/threads/{thread_id}/messages")
-async def send_message(
+@router.post("/threads/{thread_id}/runs", status_code=202)
+async def start_run(
     thread_id: UUID,
     turn: ChatTurn,
     request: Request,
-    settings: SettingsDep,
-    storage: StorageDep,
-    models: Annotated[AgentModels, Depends(_agent_models)],
-) -> StreamingResponse:
-    """Send a message; the agent's work streams back as server-sent events."""
-    async with studio_store(settings) as store:
-        if await store.get_thread(thread_id) is None:
-            raise NotFoundError(f"no chat {thread_id}")
-        for asset_id in turn.asset_ids:
-            asset = await store.get_asset(asset_id)
-            if asset is None or asset["thread_id"] != thread_id:
-                raise ValidationError(f"image {asset_id} is not part of this chat")
+    store: StoreDep,
+    dispatcher: DispatcherDep,
+    _models: Annotated[AgentModels, Depends(_agent_models)],  # 503 now, not a failed run later
+) -> JSONResponse:
+    """Send a message: saves it, queues the agent turn on a background worker,
+    and returns at once. Follow it with GET /v1/studio/runs/{id}/events."""
+    if await store.get_thread(thread_id) is None:
+        raise NotFoundError(f"no chat {thread_id}")
+    for asset_id in turn.asset_ids:
+        asset = await store.get_asset(asset_id)
+        if asset is None or asset["thread_id"] != thread_id:
+            raise ValidationError(f"image {asset_id} is not part of this chat")
 
-    writer_factory: Callable[[Settings, Storage], GenerationService] = (
-        request.app.state.writer_factory
+    active = await store.active_run(thread_id)
+    if active:
+        active = await _reconcile(request, store, active)
+    if active and active["status"] in ACTIVE_RUN:
+        return _busy(active)
+    message = await store.add_message(thread_id, "user", turn.content, asset_ids=turn.asset_ids)
+    try:
+        run = await store.create_run(thread_id, message["id"])
+    except ActiveRunExists as exc:  # lost a race with a concurrent send
+        return _busy(exc.existing or {})
+    call_id = await dispatcher.spawn_agent(run["id"])
+    await store.set_run_call_id(run["id"], call_id)
+    return JSONResponse(
+        status_code=202,
+        content=json.loads(json.dumps({"run": run, "message": message}, default=str)),
     )
 
+
+def _busy(active: dict[str, Any]) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "turn_in_progress",
+                "message": "The agent is still working on the previous message",
+                "run_id": str(active.get("id")),
+            }
+        },
+    )
+
+
+async def _reconcile(request: Request, store: StudioStore, run: dict[str, Any]) -> dict[str, Any]:
+    """A worker that died without finishing (OOM, timeout, preemption) must not
+    leave the chat locked: mark it failed and close its event log."""
+    if run["status"] not in ACTIVE_RUN or not run.get("modal_call_id"):
+        return run
+    dispatcher = request.app.state.dispatcher
+    state, detail = await dispatcher.poll(run["modal_call_id"])
+    if state == "running":
+        return run
+    fresh = await store.get_run(run["id"])
+    if fresh and fresh["status"] in ACTIVE_RUN:
+        message = f"the agent worker stopped unexpectedly: {detail or 'unknown'}"
+        await store.append_events(
+            run["id"], [("error", {"message": message}), ("done", {"status": "failed"})]
+        )
+        await store.finish_run(run["id"], "failed", message)
+    return await store.get_run(run["id"]) or run
+
+
+@router.get("/runs/{run_id}")
+async def get_run(run_id: UUID, request: Request, store: StoreDep) -> dict[str, Any]:
+    run = await store.get_run(run_id)
+    if run is None:
+        raise NotFoundError(f"no agent run {run_id}")
+    return await _reconcile(request, store, run)
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: UUID, request: Request, store: StoreDep) -> dict[str, Any]:
+    run = await store.get_run(run_id)
+    if run is None:
+        raise NotFoundError(f"no agent run {run_id}")
+    if run["status"] in ACTIVE_RUN:
+        if run.get("modal_call_id"):
+            await request.app.state.dispatcher.cancel(run["modal_call_id"])
+        await store.append_events(
+            run_id, [("error", {"message": "Stopped."}), ("done", {"status": "cancelled"})]
+        )
+        await store.finish_run(run_id, "cancelled", "cancelled via API")
+    return await store.get_run(run_id) or run
+
+
+@router.get("/runs/{run_id}/events")
+async def run_events(
+    run_id: UUID, request: Request, settings: SettingsDep, after_id: int = Query(0, ge=0)
+) -> StreamingResponse:
+    """The turn's event log as SSE, from `after_id` onwards.
+
+    Every event carries `seq`; a client that reconnects with the last `seq` it
+    saw gets exactly the events it missed. Polls every 0.4 s (tokens are
+    coalesced by the worker, so this is a handful of rows per poll).
+    """
+    async with studio_store(settings) as store:
+        if await store.get_run(run_id) is None:
+            raise NotFoundError(f"no agent run {run_id}")
+
     async def stream() -> AsyncIterator[str]:
+        last, beat = after_id, time.monotonic()
         # Own connection for the life of the stream (see runs.run_events).
         async with studio_store(settings) as store:
-            designer = (
-                models.primary.with_fallbacks(models.fallbacks)
-                if models.fallbacks
-                else models.primary
-            )
-            tools = build_tools(
-                ToolContext(
-                    thread_id=thread_id,
-                    store=store,
-                    generation=writer_factory(settings, storage),
-                    designer=designer,  # type: ignore[arg-type]
-                )
-            )
-            agent = build_agent(models.primary, models.fallbacks, tools)
-            async for event in run_turn(
-                agent=agent,
-                store=store,
-                thread_id=thread_id,
-                user_text=turn.content,
-                asset_ids=turn.asset_ids,
-                model_names=models.names,
-            ):
-                kind = event.pop("type")
-                yield f"event: {kind}\ndata: {json.dumps(event, default=str, ensure_ascii=False)}\n\n"
+            while True:
+                rows = await store.events_after(run_id, last)
+                for row in rows:
+                    last = row["id"]
+                    payload = {**row["data"], "seq": row["id"]}
+                    yield f"event: {row['type']}\ndata: {json.dumps(payload, default=str, ensure_ascii=False)}\n\n"
+                    if row["type"] == "done":
+                        return
+                if not rows:
+                    run = await store.get_run(run_id)
+                    if run is not None:
+                        run = await _reconcile(request, store, run)
+                    if run is None or (
+                        run["status"] not in ACTIVE_RUN
+                        and not await store.events_after(run_id, last)
+                    ):
+                        yield f"event: done\ndata: {json.dumps({'status': run['status'] if run else 'missing', 'seq': last})}\n\n"
+                        return
+                if time.monotonic() - beat > HEARTBEAT_S:
+                    beat = time.monotonic()
+                    yield f"event: heartbeat\ndata: {json.dumps({'seq': last})}\n\n"
+                await asyncio.sleep(EVENT_POLL_S)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 

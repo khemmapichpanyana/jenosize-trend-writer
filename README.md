@@ -235,7 +235,20 @@ re-run touches only what changed.
 ## Studio: the content agent
 
 A LangChain 1.x agent (`studio/`) served with the jobs API, used from the
-console in `../jenosize-ai-content-web`.
+console in `../jenosize-ai-content-web`. **Everything runs on Modal in one
+service**: the HTTP API, the agent workers, the training and eval jobs, and the
+GPU model server.
+
+**Agent turns are background runs**, the same way training jobs are. Sending a
+message saves it, queues an `agent_run`, and returns `202` straight away. A
+Modal `agent_worker` container executes the turn and appends each event
+(tokens, tool steps, the article streaming in from the writer) to
+`agent_events`. Consecutive tokens are coalesced, so the database sees about 4
+writes a second. The console follows `GET /v1/studio/runs/{id}/events` and
+resumes from the last `seq` it saw, so a reload, a dropped connection or a
+closed tab doesn't stop the agent. There's one active turn per chat (enforced by
+a database index), cancel is `POST /v1/studio/runs/{id}/cancel`, and a worker
+that dies is marked failed on the next read.
 
 | Piece | What it does |
 |---|---|

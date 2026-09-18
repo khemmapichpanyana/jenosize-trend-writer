@@ -8,6 +8,7 @@ uses `modal/jobs.py::ModalDispatcher`; tests and `make jobs-dev` use
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -36,6 +37,10 @@ class Dispatcher(Protocol):
         """Live container stats per Modal function (backlog, runners, running inputs)."""
         ...
 
+    async def spawn_agent(self, run_id: UUID) -> str:
+        """Start the background worker for one queued agent turn; returns a call id."""
+        ...
+
 
 class InlineDispatcher:
     """Runs jobs as asyncio tasks in this process — for tests and local dev.
@@ -49,10 +54,15 @@ class InlineDispatcher:
         settings: Settings,
         storage: Storage | None,
         remote_runner: RemoteRunner | None = None,
+        *,
+        agent_models_factory: Callable[[Settings], Any] | None = None,
+        writer_factory: Callable[[Settings, Storage], Any] | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
         self._remote_runner = remote_runner
+        self._agent_models_factory = agent_models_factory
+        self._writer_factory = writer_factory
         self._tasks: dict[str, asyncio.Task[Any]] = {}
 
     async def spawn(self, kind: str, job_id: UUID, params: dict[str, Any]) -> str:
@@ -94,6 +104,29 @@ class InlineDispatcher:
         return {
             "inline_worker": {"backlog": 0, "num_total_runners": 1, "num_running_inputs": running}
         }
+
+    async def spawn_agent(self, run_id: UUID) -> str:
+        from studio.api import default_writer, studio_store
+        from studio.llm import build_agent_models
+        from studio.runner import execute_agent_run
+
+        assert self._storage is not None, "InlineDispatcher needs storage to run the agent"
+        storage = self._storage
+
+        async def work() -> str:
+            async with studio_store(self._settings) as store:
+                return await execute_agent_run(
+                    run_id,
+                    store=store,
+                    settings=self._settings,
+                    storage=storage,
+                    models_factory=self._agent_models_factory or build_agent_models,
+                    writer_factory=self._writer_factory or default_writer,
+                )
+
+        call_id = f"inline-agent-{uuid4().hex[:12]}"
+        self._tasks[call_id] = asyncio.create_task(work())
+        return call_id
 
     async def drain(self) -> None:
         """Wait for every spawned job (tests)."""

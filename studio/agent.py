@@ -124,13 +124,19 @@ async def run_turn(
     user_text: str,
     asset_ids: list[UUID],
     model_names: list[str],
+    save_user_message: bool = True,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Persist the user turn, stream the agent's work, persist the reply."""
+    """Stream the agent's work on one turn and persist the reply.
+
+    `save_user_message=False` when the user message was already stored (the
+    background-run path stores it when the turn is queued, so a reload shows it).
+    """
     thread = await store.get_thread(thread_id)
     if thread is None:
         yield {"type": "error", "message": f"no chat {thread_id}"}
         return
-    await store.add_message(thread_id, "user", user_text, asset_ids=asset_ids)
+    if save_user_message:
+        await store.add_message(thread_id, "user", user_text, asset_ids=asset_ids)
     if thread["title"] == "New chat":
         await store.touch_thread(
             thread_id, title=user_text.strip().splitlines()[0][:TITLE_CHARS] or "New chat"

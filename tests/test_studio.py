@@ -155,14 +155,21 @@ def make_client(
             names=["primary", "fallback"][: 1 + len(fallbacks)],
         )
 
-    app = create_jobs_app(
-        InlineDispatcher(settings, r2),
-        settings,
-        r2,
-        agent_models_factory=models,
-        writer_factory=default_writer,
+    return AsyncClient(
+        transport=ASGITransport(app=studio_app(settings, r2, models)), base_url="http://studio"
     )
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://studio")
+
+
+def studio_app(
+    settings: Settings, r2: Any, models: Callable[[Settings], AgentModels] | None = None
+) -> Any:
+    """The app with the same agent factories on the API (config check) and the
+    dispatcher (which now runs the turn in the background)."""
+    kwargs: dict[str, Any] = {"writer_factory": default_writer}
+    if models is not None:
+        kwargs["agent_models_factory"] = models
+    dispatcher = InlineDispatcher(settings, r2, **kwargs)
+    return create_jobs_app(dispatcher, settings, r2, **kwargs)
 
 
 def png_bytes(size: tuple[int, int] = (64, 32)) -> bytes:
@@ -189,11 +196,20 @@ async def sse_events(response: Any) -> list[tuple[str, dict[str, Any]]]:
 async def chat(
     client: AsyncClient, thread_id: str, content: str, asset_ids: list[str] | None = None
 ) -> list[tuple[str, dict[str, Any]]]:
-    async with client.stream(
-        "POST",
-        f"/v1/studio/threads/{thread_id}/messages",
+    started = await client.post(
+        f"/v1/studio/threads/{thread_id}/runs",
         headers=KEY,
         json={"content": content, "asset_ids": asset_ids or []},
+    )
+    assert started.status_code == 202, started.text
+    return await follow(client, started.json()["run"]["id"])
+
+
+async def follow(
+    client: AsyncClient, run_id: str, after: int = 0
+) -> list[tuple[str, dict[str, Any]]]:
+    async with client.stream(
+        "GET", f"/v1/studio/runs/{run_id}/events?after_id={after}", headers=KEY
     ) as response:
         assert response.status_code == 200, await response.aread()
         return await sse_events(response)
@@ -228,8 +244,10 @@ async def test_a_turn_writes_designs_and_persists(
     names = [n for n, _ in events]
     assert names[0] == "thread" and names[-2:] == ["message", "done"]
     assert "error" not in names, events
-    # The article streamed into the panel from the (mock) fine-tuned writer…
-    assert names.count("artifact_delta") > 20
+    # The article streamed into the panel from the (mock) fine-tuned writer. The
+    # worker coalesces deltas, so check the text that arrived, not the row count.
+    drafted = "".join(p["text"] for n, p in events if n == "artifact_delta")
+    assert len(drafted.split()) > 300
     tools = [p["name"] for n, p in events if n == "tool_start"]
     assert tools == ["write_article", "design_page"]
     artifacts = [p for n, p in events if n == "artifact"]
@@ -295,13 +313,11 @@ async def test_primary_failure_falls_back(
 async def test_no_agent_model_is_a_clear_503(
     studio_settings: Settings, r2: Any, clean_db: None
 ) -> None:
-    app = create_jobs_app(
-        InlineDispatcher(studio_settings, r2), studio_settings, r2
-    )  # real factory, nothing configured
+    app = studio_app(studio_settings, r2)  # real factory, nothing configured
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
         thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
         response = await client.post(
-            f"/v1/studio/threads/{thread['id']}/messages", headers=KEY, json={"content": "hi"}
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "hi"}
         )
     assert response.status_code == 503 and "MODEL_BASE_URL" in response.json()["error"]["message"]
 
@@ -313,7 +329,7 @@ async def test_foreign_images_cannot_be_attached(
         _, other_image = await new_thread_with_image(client)
         mine = (await client.post("/v1/studio/threads", headers=KEY)).json()
         response = await client.post(
-            f"/v1/studio/threads/{mine['id']}/messages",
+            f"/v1/studio/threads/{mine['id']}/runs",
             headers=KEY,
             json={"content": "use it", "asset_ids": [other_image]},
         )
@@ -531,16 +547,16 @@ async def test_a_streaming_model_reply_is_not_doubled(
             primary=StreamingScriptedModel(script=script, model_label="primary"), names=["primary"]
         )
 
-    app = create_jobs_app(
-        InlineDispatcher(studio_settings, r2), studio_settings, r2, agent_models_factory=models
-    )
+    app = studio_app(studio_settings, r2, models)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
         thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
         events = await chat(client, thread["id"], "hi")
     tokens = [p["text"] for n, p in events if n == "token"]
     reply = next(p for n, p in events if n == "message")["content"]
-    assert len(tokens) > 3  # it really streamed
     assert reply == "Here is a streamed answer in several tokens."
+    # Tokens are coalesced in the event log; what reaches the console must add
+    # up to exactly the reply once (the doubling bug would show here).
+    assert "".join(tokens).strip() == reply
 
 
 async def test_a_streaming_model_can_call_tools(
@@ -552,13 +568,7 @@ async def test_a_streaming_model_can_call_tools(
             names=["primary"],
         )
 
-    app = create_jobs_app(
-        InlineDispatcher(studio_settings, r2),
-        studio_settings,
-        r2,
-        agent_models_factory=models,
-        writer_factory=default_writer,
-    )
+    app = studio_app(studio_settings, r2, models)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
         thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
         events = await chat(client, thread["id"], "write it")
@@ -570,7 +580,7 @@ async def test_mock_agent_runs_the_studio_without_any_model_account(
     studio_settings: Settings, r2: Any, clean_db: None
 ) -> None:
     settings = studio_settings.model_copy(update={"agent_provider": "mock"})
-    app = create_jobs_app(InlineDispatcher(settings, r2), settings, r2)  # the real factory
+    app = studio_app(settings, r2)  # the real factory
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
         thread_id, image_id = await new_thread_with_image(client)
         events = await chat(client, thread_id, "Agentic AI in retail", [image_id])
@@ -578,3 +588,143 @@ async def test_mock_agent_runs_the_studio_without_any_model_account(
     design = next(p for n, p in events if n == "tool_end" and p["name"] == "design_page")["result"]
     assert design["images_used"] == 1  # the attached image made it onto the page
     assert next(p for n, p in events if n == "message")["content"].startswith("(mock agent)")
+
+
+# ------------------------------------------------------------------ background runs
+
+
+class Gate:
+    """Holds the scripted model until released, so a turn stays 'running'."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.event = threading.Event()
+
+    def script(self, messages: list[BaseMessage]) -> AIMessage:
+        self.event.wait(timeout=10)
+        return AIMessage("Released.")
+
+
+async def test_a_turn_finishes_even_if_nobody_is_watching(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    app = studio_app(
+        studio_settings,
+        r2,
+        lambda _: AgentModels(primary=ScriptedModel(script=writer_then_designer([])), names=["p"]),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
+        thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
+        started = await client.post(
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "write it"}
+        )
+        assert started.status_code == 202
+        # The user message is saved before the agent starts: a reload shows it.
+        assert started.json()["message"]["content"] == "write it"
+        await app.state.dispatcher.drain()  # the "tab" was closed; the worker kept going
+
+        run = (
+            await client.get(f"/v1/studio/runs/{started.json()['run']['id']}", headers=KEY)
+        ).json()
+        detail = (await client.get(f"/v1/studio/threads/{thread['id']}", headers=KEY)).json()
+        replay = await follow(client, run["id"])
+    assert run["status"] == "succeeded"
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+    assert detail["active_run"] is None
+    assert [n for n, _ in replay][-1] == "done"  # the full log is replayable afterwards
+
+
+async def test_reconnecting_with_seq_resumes_without_gaps(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    async with make_client(studio_settings, r2, writer_then_designer([])) as client:
+        thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
+        started = await client.post(
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "write it"}
+        )
+        run_id = started.json()["run"]["id"]
+        everything = await follow(client, run_id)
+        middle = everything[len(everything) // 2][1]["seq"]
+        resumed = await follow(client, run_id, after=middle)  # e.g. after a dropped connection
+    assert [p["seq"] for _, p in resumed] == [p["seq"] for _, p in everything if p["seq"] > middle]
+    assert resumed[-1][0] == "done"
+
+
+async def test_one_turn_at_a_time_and_cancel(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    gate = Gate()
+    app = studio_app(
+        studio_settings,
+        r2,
+        lambda _: AgentModels(primary=ScriptedModel(script=gate.script), names=["p"]),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://studio") as client:
+        thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
+        first = (
+            await client.post(
+                f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "one"}
+            )
+        ).json()
+        second = await client.post(
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "two"}
+        )
+        assert second.status_code == 409
+        assert second.json()["error"]["run_id"] == first["run"]["id"]
+
+        cancelled = (
+            await client.post(f"/v1/studio/runs/{first['run']['id']}/cancel", headers=KEY)
+        ).json()
+        gate.event.set()
+        await app.state.dispatcher.drain()
+        events = await follow(client, first["run"]["id"])
+        # The chat is free again straight away.
+        third = await client.post(
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "three"}
+        )
+        await app.state.dispatcher.drain()
+    assert cancelled["status"] == "cancelled"
+    assert ("done", "cancelled") in [(n, p.get("status")) for n, p in events]
+    assert third.status_code == 202
+
+
+async def test_a_crashed_worker_does_not_lock_the_chat(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    async with make_client(studio_settings, r2, writer_then_designer([])) as client:
+        thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
+        # A run whose worker vanished (its call id is unknown to the dispatcher).
+        import psycopg
+
+        with psycopg.connect(studio_settings.database_url or "", autocommit=True) as conn:
+            message = conn.execute(
+                "insert into chat_messages (thread_id, role, content) values (%s, 'user', 'lost') returning id",
+                (thread["id"],),
+            ).fetchone()
+            assert message is not None
+            conn.execute(
+                "insert into agent_runs (thread_id, message_id, status, modal_call_id) values (%s, %s, 'running', 'gone')",
+                (thread["id"], message[0]),
+            )
+        detail = (await client.get(f"/v1/studio/threads/{thread['id']}", headers=KEY)).json()
+        assert detail["active_run"]["status"] == "failed"
+        retry = await client.post(
+            f"/v1/studio/threads/{thread['id']}/runs", headers=KEY, json={"content": "again"}
+        )
+        assert retry.status_code == 202
+        await client._transport.app.state.dispatcher.drain()  # type: ignore[attr-defined]
+
+
+async def test_token_events_are_coalesced(
+    studio_settings: Settings, r2: Any, clean_db: None
+) -> None:
+    async with make_client(studio_settings, r2, writer_then_designer([])) as client:
+        thread = (await client.post("/v1/studio/threads", headers=KEY)).json()
+        events = await chat(client, thread["id"], "write it")
+    deltas = [p for n, p in events if n == "artifact_delta"]
+    streamed = "".join(p["text"] for p in deltas)
+    # The mock writer emits ~700 word tokens; the log stores a handful of rows,
+    # and nothing is lost in the merge.
+    assert 0 < len(deltas) < 50
+    assert len(streamed.split()) > 300

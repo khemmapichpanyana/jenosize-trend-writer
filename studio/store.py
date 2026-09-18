@@ -8,6 +8,16 @@ from uuid import UUID
 import psycopg
 from psycopg.types.json import Jsonb
 
+ACTIVE_RUN = ("queued", "running")
+
+
+class ActiveRunExists(RuntimeError):
+    """The chat already has a turn in progress."""
+
+    def __init__(self, existing: dict[str, Any] | None) -> None:
+        super().__init__("an agent turn is already running in this chat")
+        self.existing = existing
+
 
 class StudioStore:
     def __init__(self, conn: psycopg.AsyncConnection[dict[str, Any]]) -> None:
@@ -237,4 +247,66 @@ class StudioStore:
         return await self._one(
             "update published_content set status = %s, updated_at = now() where slug = %s returning *",
             (status, slug),
+        )
+
+    # ------------------------------------------------------------ agent runs
+
+    async def create_run(self, thread_id: UUID, message_id: UUID) -> dict[str, Any]:
+        """Queue a turn; the partial unique index allows one active turn per chat."""
+        try:
+            row = await self._one(
+                "insert into agent_runs (thread_id, message_id) values (%s, %s) returning *",
+                (thread_id, message_id),
+            )
+        except psycopg.errors.UniqueViolation:
+            raise ActiveRunExists(await self.active_run(thread_id)) from None
+        assert row is not None
+        return row
+
+    async def get_run(self, run_id: UUID) -> dict[str, Any] | None:
+        return await self._one("select * from agent_runs where id = %s", (run_id,))
+
+    async def active_run(self, thread_id: UUID) -> dict[str, Any] | None:
+        return await self._one(
+            "select * from agent_runs where thread_id = %s and status in ('queued', 'running')",
+            (thread_id,),
+        )
+
+    async def set_run_call_id(self, run_id: UUID, call_id: str) -> None:
+        await self._conn.execute(
+            "update agent_runs set modal_call_id = %s where id = %s", (call_id, run_id)
+        )
+
+    async def mark_run_running(self, run_id: UUID) -> bool:
+        """Claim the run; False if it was cancelled before the worker started."""
+        row = await self._one(
+            "update agent_runs set status = 'running', started_at = now() "
+            "where id = %s and status = 'queued' returning id",
+            (run_id,),
+        )
+        return row is not None
+
+    async def finish_run(self, run_id: UUID, status: str, error: str | None = None) -> None:
+        """Terminal transition; an already-terminal run (e.g. cancelled) wins."""
+        await self._conn.execute(
+            "update agent_runs set status = %s, error = %s, finished_at = now() "
+            "where id = %s and status in ('queued', 'running')",
+            (status, error, run_id),
+        )
+
+    async def append_events(self, run_id: UUID, events: list[tuple[str, dict[str, Any]]]) -> None:
+        if not events:
+            return
+        async with self._conn.cursor() as cur:
+            await cur.executemany(
+                "insert into agent_events (run_id, type, data) values (%s, %s, %s)",
+                [(run_id, kind, Jsonb(data)) for kind, data in events],
+            )
+
+    async def events_after(
+        self, run_id: UUID, after_id: int, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        return await self._all(
+            "select id, type, data from agent_events where run_id = %s and id > %s order by id limit %s",
+            (run_id, after_id, limit),
         )

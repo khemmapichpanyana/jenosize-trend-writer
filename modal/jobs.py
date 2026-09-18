@@ -53,6 +53,37 @@ async def job_worker(job_id: str, kind: str, params: dict[str, Any]) -> dict[str
     )
 
 
+# One agent turn: minutes at most, but a cold GPU for the writer can add 1-3
+# min, and a long article plus a page design adds more. 30 min is a hard ceiling
+# on a runaway turn, not an expected duration.
+AGENT_TIMEOUT = 30 * MINUTES
+
+
+@app.function(image=app_image, secrets=[r2_secret, pipeline_secret], timeout=AGENT_TIMEOUT)
+async def agent_worker(run_id: str) -> str:
+    """Executes one queued chat turn; events go to Postgres as they happen.
+
+    CPU only: the agent's models are remote (Modal vLLM, or the fallback LLM),
+    so this container just orchestrates and streams.
+    """
+    from app.core.config import Settings
+    from app.storage.r2 import R2Storage
+    from studio.api import default_writer, studio_store
+    from studio.llm import build_agent_models
+    from studio.runner import execute_agent_run
+
+    settings = Settings()
+    async with studio_store(settings) as store:
+        return await execute_agent_run(
+            UUID(run_id),
+            store=store,
+            settings=settings,
+            storage=R2Storage(settings),
+            models_factory=build_agent_models,
+            writer_factory=default_writer,
+        )
+
+
 class ModalDispatcher:
     """`pipeline.api.Dispatcher` backed by Modal function calls."""
 
@@ -90,6 +121,10 @@ class ModalDispatcher:
         await models_volume.reload.aio()
         return scan_adapters(MODELS_DIR), read_active(MODELS_DIR)
 
+    async def spawn_agent(self, run_id: UUID) -> str:
+        call = await agent_worker.spawn.aio(str(run_id))
+        return call.object_id
+
     async def function_stats(self) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
         for name, fn in (
@@ -97,6 +132,7 @@ class ModalDispatcher:
             ("evaluate", evaluate),
             ("publish", publish),
             ("job_worker", job_worker),
+            ("agent_worker", agent_worker),
         ):
             stats = await fn.get_current_stats.aio()
             out[name] = {

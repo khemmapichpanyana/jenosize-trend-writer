@@ -17,7 +17,7 @@ After the one-time bootstrap (`modal setup`, `make modal-secrets`,
 | model | `POST /v1/train` · `POST /v1/eval` · `GET /v1/adapters` · `/adapters/{v}/activate` · `/adapters/{v}/publish` |
 | runs | `GET /v1/runs` · `GET /v1/runs/{id}` · `/runs/{id}/events` (live SSE) · `/runs/{id}/progress` · `POST /v1/runs/{id}/cancel` |
 | compute | `GET /v1/resources` (Modal containers + live GPU telemetry) |
-| studio | `/v1/studio/threads` (chat with the content agent, SSE) · `/assets` · `/artifacts` · `/content` |
+| studio | `/v1/studio/threads` · `POST /threads/{id}/runs` (queue an agent turn) · `/runs/{id}/events` (resumable SSE) · `/runs/{id}/cancel` · `/assets` · `/artifacts` · `/content` |
 | public | `GET /p/{slug}` · `GET /p/assets/{id}` — shared pages, no key |
 
 Every `/v1` route needs the `X-API-Key` header; `/p/*` is public by design.

@@ -15,9 +15,12 @@ After the one-time bootstrap (`modal setup`, `make modal-secrets`,
 | labels | `POST /v1/label/preview` · `POST /v1/label` |
 | datasets | `POST /v1/datasets` · `GET /v1/datasets` · `/datasets/{v}/validate` · `/card` · `/examples` |
 | model | `POST /v1/train` · `POST /v1/eval` · `GET /v1/adapters` · `/adapters/{v}/activate` · `/adapters/{v}/publish` |
-| runs | `GET /v1/runs` · `GET /v1/runs/{id}` · `POST /v1/runs/{id}/cancel` |
+| runs | `GET /v1/runs` · `GET /v1/runs/{id}` · `/runs/{id}/events` (live SSE) · `/runs/{id}/progress` · `POST /v1/runs/{id}/cancel` |
+| compute | `GET /v1/resources` (Modal containers + live GPU telemetry) |
+| studio | `/v1/studio/threads` (chat with the content agent, SSE) · `/assets` · `/artifacts` · `/content` |
+| public | `GET /p/{slug}` · `GET /p/assets/{id}` — shared pages, no key |
 
-Every `/v1` route needs the `X-API-Key` header.
+Every `/v1` route needs the `X-API-Key` header; `/p/*` is public by design.
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ def create_jobs_app(
     dispatcher: Dispatcher,
     settings: Settings | None = None,
     storage: Storage | None = None,
+    *,
+    agent_models_factory: Callable[[Settings], Any] | None = None,
+    writer_factory: Callable[[Settings, Storage], Any] | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
@@ -61,6 +67,12 @@ def create_jobs_app(
     app.state.settings = settings
     app.state.dispatcher = dispatcher
     app.state.storage_factory = _storage_factory(settings, storage)
+    # The studio's models are injectable so the agent is testable without GPUs.
+    from studio.api import default_writer
+    from studio.llm import build_agent_models
+
+    app.state.agent_models_factory = agent_models_factory or build_agent_models
+    app.state.writer_factory = writer_factory or default_writer
     register_exception_handlers(app)
 
     @app.get("/health", tags=["meta"])
@@ -76,8 +88,13 @@ def create_jobs_app(
             },
         }
 
+    from studio.api import public as studio_public
+    from studio.api import router as studio_router
+
     for module in (setup, data, models, runs):
         app.include_router(module.router)
+    app.include_router(studio_router)
+    app.include_router(studio_public)
     return app
 
 

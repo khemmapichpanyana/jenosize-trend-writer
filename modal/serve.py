@@ -64,6 +64,12 @@ class VLLMServer:
             str(MAX_MODEL_LEN),
             "--api-key",
             os.environ.get("VLLM_API_KEY", "not-needed"),
+            # The studio agent orchestrates with tool calls on this server; vLLM
+            # rejects `tools` unless auto tool choice + a parser are enabled.
+            # Qwen models emit Hermes-style tool calls.
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "hermes",
         ]
 
         # Every complete adapter on the volume is registered under its own name

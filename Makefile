@@ -5,7 +5,7 @@ help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 install:  ## Create the venv: runtime + dev + pipeline + Modal CLI
-	$(UV) sync --group dev --group pipeline --group modal
+	$(UV) sync --group dev --group pipeline --group modal --group agent
 
 dev:  ## Run the API locally with autoreload (mock provider, no cloud needed)
 	$(UV) run uvicorn app.main:app --reload --port 8000

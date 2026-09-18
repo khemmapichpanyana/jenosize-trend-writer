@@ -10,7 +10,7 @@ from fastapi import APIRouter
 
 from app.core.errors import AppError
 from pipeline import migrate
-from pipeline.api.deps import GUARDED, DispatcherDep, SettingsDep, StorageDep
+from pipeline.api.deps import GUARDED, DispatcherDep, SettingsDep, StorageDep, Stores
 from pipeline.api.schemas import DoctorCheck, Migration
 
 router = APIRouter(prefix="/v1", tags=["setup"], dependencies=GUARDED)
@@ -125,3 +125,14 @@ async def doctor(
             DoctorCheck(check="adapters", ok=False, detail=f"{type(exc).__name__}: {exc}"[:200])
         )
     return checks
+
+
+@router.get("/resources")
+async def resources(pair: Stores, dispatcher: DispatcherDep) -> dict[str, Any]:
+    """Live compute: Modal containers per function, and every active job with
+    its latest GPU telemetry (utilisation, memory, loss)."""
+    try:
+        functions = await dispatcher.function_stats()
+    except Exception as exc:  # stats are advisory; never fail the page
+        functions = {"error": {"message": f"{type(exc).__name__}: {exc}"[:200]}}  # type: ignore[dict-item]
+    return {"functions": functions, "active_jobs": await pair[1].active_with_latest_progress()}

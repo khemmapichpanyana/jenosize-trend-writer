@@ -32,6 +32,10 @@ class Dispatcher(Protocol):
 
     async def activate_adapter(self, version: str) -> None: ...
 
+    async def function_stats(self) -> dict[str, dict[str, int]]:
+        """Live container stats per Modal function (backlog, runners, running inputs)."""
+        ...
+
 
 class InlineDispatcher:
     """Runs jobs as asyncio tasks in this process — for tests and local dev.
@@ -84,6 +88,12 @@ class InlineDispatcher:
 
     async def activate_adapter(self, version: str) -> None:
         adapters.write_active(self._settings.models_dir, version)
+
+    async def function_stats(self) -> dict[str, dict[str, int]]:
+        running = sum(1 for t in self._tasks.values() if not t.done())
+        return {
+            "inline_worker": {"backlog": 0, "num_total_runners": 1, "num_running_inputs": running}
+        }
 
     async def drain(self) -> None:
         """Wait for every spawned job (tests)."""

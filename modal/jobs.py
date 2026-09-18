@@ -90,6 +90,22 @@ class ModalDispatcher:
         await models_volume.reload.aio()
         return scan_adapters(MODELS_DIR), read_active(MODELS_DIR)
 
+    async def function_stats(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for name, fn in (
+            ("train", train),
+            ("evaluate", evaluate),
+            ("publish", publish),
+            ("job_worker", job_worker),
+        ):
+            stats = await fn.get_current_stats.aio()
+            out[name] = {
+                "backlog": stats.backlog,
+                "num_total_runners": stats.num_total_runners,
+                "num_running_inputs": stats.num_running_inputs,
+            }
+        return out
+
     async def activate_adapter(self, version: str) -> None:
         from pipeline.adapters import write_active
 

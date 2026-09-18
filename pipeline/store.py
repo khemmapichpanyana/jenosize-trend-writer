@@ -478,6 +478,35 @@ class JobStore:
             await cur.execute("select * from job_runs where id = %s", (job_id,))
             return await cur.fetchone()
 
+    async def progress(
+        self, job_id: UUID, *, after_id: int = 0, limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        """Training telemetry rows for a run, oldest first, after `after_id`."""
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "select * from training_progress where job_id = %s and id > %s order by id limit %s",
+                (job_id, after_id, limit),
+            )
+            return list(await cur.fetchall())
+
+    async def active_with_latest_progress(self) -> list[dict[str, Any]]:
+        """Queued/running jobs, each with its most recent telemetry row (if any)."""
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                """
+                select j.id, j.kind, j.status, j.started_at, j.params,
+                       to_jsonb(p) - 'job_id' as latest
+                from job_runs j
+                left join lateral (
+                    select * from training_progress tp
+                    where tp.job_id = j.id order by tp.id desc limit 1
+                ) p on true
+                where j.status in ('queued', 'running')
+                order by j.created_at
+                """
+            )
+            return list(await cur.fetchall())
+
     async def list(self, *, limit: int = 20, kind: str | None = None) -> list[dict[str, Any]]:
         async with self._conn.cursor() as cur:
             await cur.execute(

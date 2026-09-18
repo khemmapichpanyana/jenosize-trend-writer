@@ -34,7 +34,7 @@ jobs:
           enable-cache: true
 
       - name: Install
-        run: uv sync --group dev --group pipeline --frozen
+        run: uv sync --group dev --group pipeline --group agent --frozen
 
       - name: Lint
         run: |

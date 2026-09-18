@@ -26,6 +26,7 @@ from common import (
     app,
     hf_secret,
     models_volume,
+    pipeline_secret,
     r2_client,
     r2_secret,
     train_image,
@@ -83,7 +84,8 @@ def _load_jsonl(uri: str) -> list[dict]:
     image=train_image,
     gpu="L4",
     volumes=VOLUMES,
-    secrets=[hf_secret, r2_secret],
+    # jeno-pipeline: the database, for live progress rows
+    secrets=[hf_secret, r2_secret, pipeline_secret],
     timeout=180 * MINUTES,
 )
 def train(
@@ -93,6 +95,7 @@ def train(
     lora_r: int = LORA_R,
     learning_rate: float = LEARNING_RATE,
     adapter_dir: str = "/models/jeno-lora-v1",
+    job_id: str | None = None,
 ) -> dict:
     # isort: off
     # Unsloth patches transformers/trl at import time, so it MUST be imported
@@ -104,6 +107,34 @@ def train(
     from trl import SFTConfig, SFTTrainer
 
     # isort: on
+
+    from transformers import TrainerCallback
+
+    class LiveProgress(TrainerCallback):  # type: ignore[misc]
+        """Stream every logged step to Postgres for the console's live view."""
+
+        def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[no-untyped-def]
+            logs = logs or {}
+            if "loss" not in logs:
+                return
+            progress.write(
+                phase="training",
+                step=state.global_step,
+                total_steps=state.max_steps,
+                epoch=logs.get("epoch", state.epoch),
+                loss=logs.get("loss"),
+                learning_rate=logs.get("learning_rate"),
+                grad_norm=logs.get("grad_norm"),
+                **gpu_snapshot(),
+            )
+
+    from app.core.config import Settings
+    from pipeline.progress import ProgressWriter, gpu_snapshot
+
+    progress = ProgressWriter(Settings().database_url, job_id)
+    progress.write(
+        phase="loading", message=f"loading {dataset_uri} and {BASE_MODEL}", **gpu_snapshot()
+    )
 
     rows = _load_jsonl(dataset_uri)
     if not rows:
@@ -173,6 +204,7 @@ def train(
     trainer = train_on_responses_only(
         trainer, instruction_part=INSTRUCTION_PART, response_part=RESPONSE_PART
     )
+    trainer.add_callback(LiveProgress())
 
     result = trainer.train()
     metrics = {
@@ -185,6 +217,7 @@ def train(
     }
     print(f"[jeno] {metrics}")
 
+    progress.write(phase="saving", step=int(result.global_step), message=f"saving to {adapter_dir}")
     model.save_pretrained(adapter_dir)
     tokenizer.save_pretrained(adapter_dir)
     with open(f"{adapter_dir}/jeno_train_metrics.json", "w") as fh:
@@ -192,6 +225,14 @@ def train(
 
     # Commit makes the adapter visible to the serving container on its next start.
     models_volume.commit()
+    progress.write(
+        phase="done",
+        step=metrics["steps"],
+        loss=metrics["train_loss"],
+        message="adapter committed",
+        **gpu_snapshot(),
+    )
+    progress.close()
     print(f"[jeno] adapter written to {adapter_dir} and committed to the volume")
 
     if push_to_hub:

@@ -169,6 +169,8 @@ async def execute(
                     "learning_rate": p_train.learning_rate,
                     "push_to_hub": p_train.push_to_hub,
                     "adapter_dir": adapter_dir(p_train.version),
+                    # lets the GPU job write live progress rows for this run
+                    "job_id": str(job_id) if job_id else None,
                 },
             )
         if kind == "publish":

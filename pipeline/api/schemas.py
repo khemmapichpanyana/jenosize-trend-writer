@@ -34,6 +34,23 @@ class JobRun(BaseModel):
     stages: list[StageRun] | None = None
 
 
+class ProgressPoint(BaseModel):
+    id: int
+    created_at: datetime
+    phase: str
+    step: int | None = None
+    total_steps: int | None = None
+    epoch: float | None = None
+    loss: float | None = None
+    learning_rate: float | None = None
+    grad_norm: float | None = None
+    samples_per_sec: float | None = None
+    gpu_util: float | None = None
+    gpu_mem_used_gb: float | None = None
+    gpu_mem_total_gb: float | None = None
+    message: str | None = None
+
+
 class CorpusStatus(BaseModel):
     counts: dict[str, int]
     recent_stages: list[StageRun]

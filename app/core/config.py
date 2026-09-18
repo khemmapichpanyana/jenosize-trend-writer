@@ -95,6 +95,21 @@ class Settings(BaseSettings):
     # Where trained adapters are mounted (the Modal volume `jeno-models`).
     models_dir: str = "/models"
 
+    # --- studio agent (studio/, served by the jobs API on Modal) --------------
+    # The agent's *orchestrating* model. It runs on the same Modal vLLM server as
+    # the fine-tuned writer (MODEL_BASE_URL) but uses the base weights: the LoRA
+    # is trained on the article output format, not on tool calling. The writing
+    # itself goes through the fine-tuned model (MODEL_NAME) via write_article.
+    agent_model: str = "Qwen/Qwen3-4B-Instruct-2507"
+    # Optional fallback when the GPU is cold or down (any OpenAI-compatible
+    # endpoint). Defaults to the labelling LLM when unset.
+    agent_fallback_base_url: str | None = None
+    agent_fallback_api_key: str | None = None
+    agent_fallback_model: str | None = None
+    # Base URL for shared links, e.g. the console's domain (which proxies /p/*).
+    # Unset: links point at this API itself.
+    public_share_base_url: str | None = None
+
     # --- offline labeling (pipeline only, unused by the API) -----------------
     labeler_base_url: str | None = None
     labeler_api_key: str | None = None

@@ -117,9 +117,13 @@ train_image = (
         "huggingface_hub",
         "hf_transfer",
         "boto3",  # read datasets/v1/train.jsonl straight from R2
+        # live telemetry: per-step loss + GPU gauges written to Postgres
+        "psycopg[binary]",
+        "pydantic-settings",  # app.core.config resolves the DB URL the same way everywhere
+        "nvidia-ml-py",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    .add_local_python_source("common")
+    .add_local_python_source("common", "app", "pipeline")
 )
 
 serve_image = (
@@ -132,15 +136,26 @@ serve_image = (
     .add_local_python_source("common", "pipeline")
 )
 
+
 # CPU image for everything that runs this repo's own code: the jobs API, job
 # workers and eval. Built from the same requirements.txt Vercel installs, plus
 # the pipeline's Postgres driver, so "works locally" and "works on Modal" share
 # one dependency list.
+def _dependency_group(name: str) -> list[str]:
+    """A [dependency-groups] list from pyproject.toml — one source of truth."""
+    import tomllib
+
+    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
+        return list(tomllib.load(fh)["dependency-groups"][name])
+
+
 app_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install_from_requirements(str(REPO_ROOT / "requirements.txt"))
-    .uv_pip_install("psycopg[binary]>=3.2.0")
-    .add_local_python_source("app", "pipeline", "common")
+    .uv_pip_install("psycopg[binary]>=3.2.0", *_dependency_group("agent"))
+    .add_local_python_source("app", "pipeline", "studio", "common")
+    # The agent's brand context + page theme (not .py, so added explicitly).
+    .add_local_dir(str(REPO_ROOT / "studio" / "brand"), remote_path="/root/studio/brand")
     # POST /v1/migrations/apply reads these next to the pipeline package, where
     # pipeline/migrate.py expects them (<root>/supabase/migrations).
     .add_local_dir(

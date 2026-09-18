@@ -133,8 +133,18 @@ export interface Artifact {
   published: PublishedPage[];
 }
 
+export interface AgentRun {
+  id: string;
+  thread_id: string;
+  message_id: string | null;
+  status: JobStatus;
+  error: string | null;
+}
+
 export interface ThreadDetail extends Thread {
   messages: ChatMessage[];
   artifacts: Artifact[];
   assets: Asset[];
+  /** A turn still running on its background worker (e.g. after a reload). */
+  active_run: AgentRun | null;
 }

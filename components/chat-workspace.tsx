@@ -4,9 +4,9 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, ErrorNote } from "@/components/ui";
-import { API, get, getText, post, upload } from "@/lib/api";
+import { API, ApiError, get, getText, post, upload } from "@/lib/api";
 import { streamSse } from "@/lib/sse";
-import type { Artifact, Asset, ChatMessage, PublishedPage, ThreadDetail, ToolCallRecord } from "@/lib/types";
+import type { AgentRun, Artifact, Asset, ChatMessage, PublishedPage, ThreadDetail, ToolCallRecord } from "@/lib/types";
 
 const ASSET_BASE = `${API}/studio/assets`;
 const TOOL_LABEL: Record<string, string> = {
@@ -24,6 +24,7 @@ interface LiveTool {
 }
 
 interface LiveTurn {
+  runId: string | null;
   user: string;
   assetIds: string[];
   reply: string;
@@ -54,75 +55,7 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
     }
   }, [threadId]);
 
-  useEffect(() => {
-    let cancelled = false;
-    get<ThreadDetail>(`/studio/threads/${threadId}`)
-      .then((detail) => {
-        if (cancelled) return;
-        setThread(detail);
-        if (!detail.artifacts.length) return;
-        const wanted = search.get("artifact");
-        const artifact = detail.artifacts.find((a) => a.id === wanted) ?? detail.artifacts[detail.artifacts.length - 1];
-        setSelected({ artifactId: artifact.id, version: artifact.current_version });
-      })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      cancelled = true;
-    };
-  }, [threadId, search]);
-
-  // Leaving the chat mid-turn stops the stream (the agent's saved work is kept).
-  useEffect(() => () => abortRef.current?.abort(), []);
-
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [thread?.messages.length, live?.reply, live?.tools.length]);
-
-  async function attach(files: FileList | File[]) {
-    const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    for (const file of images) {
-      setUploading((n) => n + 1);
-      try {
-        const form = new FormData();
-        form.append("file", file);
-        form.append("thread_id", threadId);
-        const asset = await upload<Asset>("/studio/assets", form);
-        setPending((p) => [...p, asset]);
-      } catch (e) {
-        setError(`Upload failed for ${file.name}: ${e instanceof Error ? e.message : e}`);
-      } finally {
-        setUploading((n) => n - 1);
-      }
-    }
-  }
-
-  async function send() {
-    const text = input.trim();
-    if (!text || live) return;
-    const assetIds = pending.map((a) => a.id);
-    setInput("");
-    setPending([]);
-    setError(null);
-    setLive({ user: text, assetIds, reply: "", tools: [] });
-    const controller = new AbortController();
-    abortRef.current = controller;
-    try {
-      await streamSse(
-        `${API}/studio/threads/${threadId}/messages`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: text, asset_ids: assetIds }) },
-        (event, data) => handleEvent(event, data as Record<string, unknown>),
-        controller.signal,
-      );
-    } catch (e) {
-      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setDraft(null);
-      await load();
-      setLive(null);
-    }
-  }
-
-  function handleEvent(event: string, data: Record<string, unknown>) {
+  const handleEvent = useCallback((event: string, data: Record<string, unknown>) => {
     switch (event) {
       case "token":
         setLive((t) => (t ? { ...t, reply: t.reply + String(data.text ?? "") } : t));
@@ -164,6 +97,130 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
       case "error":
         setError(String(data.message ?? "The agent failed"));
         break;
+    }
+  }, [load]);
+
+  /**
+   * Follow a run's event log. The worker writes events to Postgres; this
+   * replays them from `seq` 0 (or resumes after a dropped connection from the
+   * last seq seen), so nothing is lost or shown twice.
+   */
+  const followRun = useCallback(async (runId: string) => {
+    setLive((t) => (t ? { ...t, runId } : t));
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let seq = 0;
+    let finished = false;
+    let attempt = 0;
+    while (!finished && !controller.signal.aborted) {
+      try {
+        await streamSse(
+          `${API}/studio/runs/${runId}/events?after_id=${seq}`,
+          { method: "GET" },
+          (event, data) => {
+            const payload = data as Record<string, unknown>;
+            if (typeof payload.seq === "number") seq = Math.max(seq, payload.seq);
+            attempt = 0;
+            if (event === "done") finished = true;
+            else handleEvent(event, payload);
+          },
+          controller.signal,
+        );
+      } catch (e) {
+        if (controller.signal.aborted) return;
+        if (++attempt > 6) {
+          setError(e instanceof Error ? e.message : String(e));
+          break;
+        }
+      }
+      if (!finished && !controller.signal.aborted) await new Promise((r) => setTimeout(r, Math.min(8000, 500 * 2 ** attempt)));
+    }
+    if (controller.signal.aborted) return;
+    setDraft(null);
+    await load();
+    setLive(null);
+  }, [handleEvent, load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    get<ThreadDetail>(`/studio/threads/${threadId}`)
+      .then((detail) => {
+        if (cancelled) return;
+        setThread(detail);
+        const run = detail.active_run;
+        if (run) {
+          // Resume watching a turn that is still running (reload, second tab).
+          const user = detail.messages.find((m) => m.id === run.message_id);
+          setLive({ runId: run.id, user: user?.content ?? "", assetIds: user?.asset_ids ?? [], reply: "", tools: [] });
+          void followRun(run.id);
+        }
+        if (!detail.artifacts.length) return;
+        const wanted = search.get("artifact");
+        const artifact = detail.artifacts.find((a) => a.id === wanted) ?? detail.artifacts[detail.artifacts.length - 1];
+        setSelected({ artifactId: artifact.id, version: artifact.current_version });
+      })
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, [threadId, search, followRun]);
+
+  // Leaving the chat only stops *watching*: the turn runs on its own Modal
+  // worker and is picked up again (from its event log) on the next visit.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [thread?.messages.length, live?.reply, live?.tools.length]);
+
+  async function attach(files: FileList | File[]) {
+    const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    for (const file of images) {
+      setUploading((n) => n + 1);
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("thread_id", threadId);
+        const asset = await upload<Asset>("/studio/assets", form);
+        setPending((p) => [...p, asset]);
+      } catch (e) {
+        setError(`Upload failed for ${file.name}: ${e instanceof Error ? e.message : e}`);
+      } finally {
+        setUploading((n) => n - 1);
+      }
+    }
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || live) return;
+    const assetIds = pending.map((a) => a.id);
+    setInput("");
+    setPending([]);
+    setError(null);
+    setLive({ runId: null, user: text, assetIds, reply: "", tools: [] });
+    try {
+      const started = await post<{ run: AgentRun }>(`/studio/threads/${threadId}/runs`, { content: text, asset_ids: assetIds });
+      await followRun(started.run.id);
+    } catch (e) {
+      // 409: a turn is already running here (another tab?) — watch that one instead.
+      const runId = e instanceof ApiError && e.status === 409 ? (e.body as { error?: { run_id?: string } })?.error?.run_id : null;
+      if (runId) {
+        await followRun(runId);
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+        setLive(null);
+      }
+    }
+  }
+
+  async function stop() {
+    const runId = live?.runId;
+    if (!runId) return;
+    try {
+      await post(`/studio/runs/${runId}/cancel`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -254,7 +311,7 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
               disabled={!!live}
             />
             {live ? (
-              <Button onClick={() => abortRef.current?.abort()}>Stop</Button>
+              <Button onClick={stop} disabled={!live.runId}>Stop</Button>
             ) : (
               <Button variant="primary" onClick={send} disabled={!input.trim() || uploading > 0}>Send</Button>
             )}

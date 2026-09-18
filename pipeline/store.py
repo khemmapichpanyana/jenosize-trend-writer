@@ -261,6 +261,11 @@ class CorpusStore:
                 [(split, url) for url, split in splits.items()],
             )
 
+    async def dataset_versions(self) -> list[dict[str, Any]]:
+        async with self._conn.cursor() as cur:
+            await cur.execute("select * from dataset_versions order by created_at desc")
+            return list(await cur.fetchall())
+
     async def dataset_version(self, version: str) -> dict[str, Any] | None:
         async with self._conn.cursor() as cur:
             await cur.execute("select * from dataset_versions where version = %s", (version,))
@@ -316,10 +321,11 @@ class CorpusStore:
 
     # ----------------------------------------------------------- run log
 
-    async def start_run(self, stage: str) -> UUID:
+    async def start_run(self, stage: str, *, job_id: UUID | None = None) -> UUID:
         async with self._conn.cursor() as cur:
             await cur.execute(
-                "insert into pipeline_runs (stage) values (%s) returning id", (stage,)
+                "insert into pipeline_runs (stage, job_id) values (%s, %s) returning id",
+                (stage, job_id),
             )
             row = await cur.fetchone()
         assert row is not None
@@ -334,6 +340,15 @@ class CorpusStore:
             ("failed" if error else "succeeded", Jsonb(stats), error, run_id),
         )
 
+    async def stage_runs_for_job(self, job_id: UUID) -> list[dict[str, Any]]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "select stage, status, started_at, finished_at, stats, error "
+                "from pipeline_runs where job_id = %s order by started_at",
+                (job_id,),
+            )
+            return list(await cur.fetchall())
+
     async def recent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         async with self._conn.cursor() as cur:
             await cur.execute(
@@ -342,6 +357,99 @@ class CorpusStore:
                 (limit,),
             )
             return list(await cur.fetchall())
+
+
+class ActiveJobExists(RuntimeError):
+    """Another job of the same kind is queued or running."""
+
+    def __init__(self, kind: str, existing: dict[str, Any] | None) -> None:
+        super().__init__(f"a {kind} job is already active")
+        self.kind = kind
+        self.existing = existing
+
+
+class JobStore:
+    """`job_runs`: jobs started through the jobs API."""
+
+    def __init__(self, conn: psycopg.AsyncConnection[dict[str, Any]]) -> None:
+        self._conn = conn
+
+    async def create(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Insert a queued job; the partial unique index enforces one active per kind."""
+        try:
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    "insert into job_runs (kind, params) values (%s, %s) returning *",
+                    (kind, Jsonb(params)),
+                )
+                row = await cur.fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise ActiveJobExists(kind, await self.active(kind)) from None
+        assert row is not None
+        return dict(row)
+
+    async def active(self, kind: str) -> dict[str, Any] | None:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "select * from job_runs where kind = %s and status in ('queued', 'running')",
+                (kind,),
+            )
+            return await cur.fetchone()
+
+    async def set_call_id(self, job_id: UUID, call_id: str) -> None:
+        await self._conn.execute(
+            "update job_runs set modal_call_id = %s where id = %s", (call_id, job_id)
+        )
+
+    async def mark_running(self, job_id: UUID) -> None:
+        await self._conn.execute(
+            "update job_runs set status = 'running', started_at = now() "
+            "where id = %s and status = 'queued'",
+            (job_id,),
+        )
+
+    async def finish(
+        self,
+        job_id: UUID,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Move to a terminal state. A job already terminal (e.g. cancelled) wins."""
+        await self._conn.execute(
+            """
+            update job_runs set status = %s, result = %s, error = %s, finished_at = now()
+            where id = %s and status in ('queued', 'running')
+            """,
+            (status, Jsonb(result) if result is not None else None, error, job_id),
+        )
+
+    async def get(self, job_id: UUID) -> dict[str, Any] | None:
+        async with self._conn.cursor() as cur:
+            await cur.execute("select * from job_runs where id = %s", (job_id,))
+            return await cur.fetchone()
+
+    async def list(self, *, limit: int = 20, kind: str | None = None) -> list[dict[str, Any]]:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "select * from job_runs where (%s::text is null or kind = %s) "
+                "order by created_at desc limit %s",
+                (kind, kind, limit),
+            )
+            return list(await cur.fetchall())
+
+
+@asynccontextmanager
+async def connect_jobs(dsn: str) -> AsyncIterator[tuple[CorpusStore, JobStore]]:
+    """Both stores over one connection, for the jobs API and job workers."""
+    conn = await psycopg.AsyncConnection.connect(
+        dsn, autocommit=True, row_factory=dict_row, prepare_threshold=None
+    )
+    try:
+        yield CorpusStore(conn), JobStore(conn)
+    finally:
+        await conn.close()
 
 
 @asynccontextmanager

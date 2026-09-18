@@ -23,7 +23,7 @@ import os
 import random
 from typing import Any
 
-from common import BASE_MODEL, MINUTES, app, eval_image, r2_secret, vllm_secret
+from common import BASE_MODEL, MINUTES, app, app_image, r2_secret, vllm_secret
 
 # Held-out briefs. `--briefs-uri r2://datasets/v1/eval.jsonl` replaces these with
 # the real held-out split; these three keep the harness runnable before then.
@@ -171,7 +171,7 @@ def _score(markdown: str, title: str, brief: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.function(
-    image=eval_image.add_local_python_source("app"),
+    image=app_image,
     secrets=[vllm_secret, r2_secret],
     timeout=90 * MINUTES,
 )
@@ -327,7 +327,7 @@ def _upload_results(run_name: str, payload: dict[str, Any]) -> None:
 
 
 @app.local_entrypoint()
-def main(
+def eval_main(
     endpoint: str,
     run_name: str = "adhoc",
     adapter_name: str = "jeno-lora",

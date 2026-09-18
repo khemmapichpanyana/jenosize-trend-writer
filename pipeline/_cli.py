@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import UUID
 
 import anyio
 import typer
@@ -54,12 +55,15 @@ async def pipeline_context() -> AsyncIterator[tuple[Settings, CorpusStore, R2Sto
 
 
 @asynccontextmanager
-async def recorded_run(store: CorpusStore, stage: str) -> AsyncIterator[dict[str, Any]]:
+async def recorded_run(
+    store: CorpusStore, stage: str, *, job_id: UUID | None = None
+) -> AsyncIterator[dict[str, Any]]:
     """Log a stage invocation to `pipeline_runs`, succeeded or failed.
 
     The stage fills the yielded dict with its counts; it is stored as jsonb.
+    `job_id` links the stage to the jobs-API job that started it, if any.
     """
-    run_id = await store.start_run(stage)
+    run_id = await store.start_run(stage, job_id=job_id)
     stats: dict[str, Any] = {}
     started = time.perf_counter()
     try:

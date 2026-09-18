@@ -73,6 +73,7 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.12"
+plugins = ["pydantic.mypy"]
 files = ["app", "pipeline", "tests"]
 # Non-strict on purpose: this is a Day-0 skeleton and third-party stubs (supabase,
 # trafilatura, docx) are incomplete. Tighten once the ML logic lands.

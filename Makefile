@@ -60,17 +60,23 @@ pipeline: scrape clean label  ## Everything up to (not including) publishing a d
 status:  ## Corpus progress per stage + recent pipeline runs
 	$(UV) run python -m pipeline.scrape status
 
-# --- GPU jobs on Modal ------------------------------------------------------------
+# --- Modal: jobs API + GPU jobs ---------------------------------------------------
 modal-setup:  ## Authenticate the Modal CLI (opens a browser)
 	$(UV) run modal setup
 
-train:  ## Fine-tune on Modal: make train VERSION=v1
-	$(UV) run modal run modal/train.py --dataset-uri r2://datasets/$(or $(VERSION),v1)/train.jsonl
+modal-doctor:  ## Check secrets, Postgres, R2 and imports from inside Modal (~1 cent)
+	$(UV) run modal run modal/doctor.py
 
-serve:  ## Deploy the vLLM server on Modal and print its URL
-	$(UV) run modal deploy modal/serve.py
+deploy-modal:  ## Deploy jobs API + vLLM server + train/eval (ADAPTER=v1 picks the served adapter)
+	JENO_ADAPTER_VERSION=$(or $(ADAPTER),v1) $(UV) run modal deploy modal/deploy.py
 
-eval:  ## Base vs fine-tuned: make eval ENDPOINT=https://...modal.run/v1 VERSION=v1
+jobs-dev:  ## Run the jobs API locally (scrape/label in-process; train/eval need Modal)
+	$(UV) run uvicorn --factory pipeline.api:create_local_app --reload --port 8001
+
+train:  ## Fine-tune from the CLI (the jobs API does the same): make train VERSION=v1
+	$(UV) run modal run modal/train.py --version $(or $(VERSION),v1)
+
+eval:  ## Base vs fine-tuned from the CLI: make eval ENDPOINT=https://...modal.run/v1 VERSION=v1
 	$(UV) run modal run modal/eval.py --endpoint $(ENDPOINT) --briefs-uri r2://datasets/$(or $(VERSION),v1)/eval.jsonl
 
-.PHONY: migrate scrape recheck clean label corpus dataset pipeline status modal-setup train serve eval
+.PHONY: migrate scrape recheck clean label corpus dataset pipeline status modal-setup modal-doctor deploy-modal jobs-dev train eval

@@ -18,7 +18,6 @@ import subprocess
 import modal
 
 from common import (
-    ADAPTER_DIR,
     BASE_MODEL,
     MINUTES,
     VOLUMES,
@@ -30,6 +29,13 @@ from common import (
 
 VLLM_PORT = 8000
 LORA_NAME = "jeno-lora"
+
+# Which trained adapter to serve. Training writes one directory per dataset
+# version (/models/jeno-lora-v1, -v2, …); switching versions is a redeploy with
+# JENO_ADAPTER_VERSION=v2, not a code change. Read at deploy time and baked
+# into the container env below.
+ADAPTER_VERSION = os.environ.get("JENO_ADAPTER_VERSION", "v1")
+ADAPTER_DIR = f"/models/jeno-lora-{ADAPTER_VERSION}"
 
 # 8192 covers the longest brief (retrieved chunks) plus a 1500-word article with
 # room to spare; raising it costs KV-cache memory on a 24 GB L4.
@@ -48,6 +54,9 @@ MAX_MODEL_LEN = 8192
     scaledown_window=5 * MINUTES,
     startup_timeout=10 * MINUTES,
     min_containers=int(os.environ.get("JENO_MIN_CONTAINERS", "0")),
+    # The container re-imports this module in its own environment, so the
+    # deploy-time choice must be passed in explicitly or it falls back to v1.
+    env={"JENO_ADAPTER_VERSION": ADAPTER_VERSION},
 )
 class VLLMServer:
     @modal.enter()
@@ -82,6 +91,6 @@ class VLLMServer:
 
 
 @app.local_entrypoint()
-def main() -> None:
+def serve_main() -> None:
     """`modal run modal/serve.py` -> print the URL to paste into MODEL_BASE_URL."""
     print(f"{VLLMServer.get_url()}/v1")

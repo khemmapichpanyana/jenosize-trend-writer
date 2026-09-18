@@ -215,18 +215,26 @@ def train(
 
 
 @app.local_entrypoint()
-def main(
-    dataset_uri: str = "r2://datasets/v1/train.jsonl",
+def train_main(
+    version: str = "v1",
+    dataset_uri: str | None = None,
     push_to_hub: bool = False,
     epochs: int = EPOCHS,
     lora_r: int = LORA_R,
     learning_rate: float = LEARNING_RATE,
 ) -> None:
+    """`modal run modal/train.py --version v1`
+
+    The version picks both the dataset (`datasets/{version}/train.jsonl`) and the
+    adapter directory (`/models/jeno-lora-{version}`), so training v2 can never
+    overwrite the adapter trained on v1.
+    """
     metrics = train.remote(
-        dataset_uri=dataset_uri,
+        dataset_uri=dataset_uri or f"r2://datasets/{version}/train.jsonl",
         push_to_hub=push_to_hub,
         epochs=epochs,
         lora_r=lora_r,
         learning_rate=learning_rate,
+        adapter_dir=f"/models/jeno-lora-{version}",
     )
     print(json.dumps(metrics, indent=2))

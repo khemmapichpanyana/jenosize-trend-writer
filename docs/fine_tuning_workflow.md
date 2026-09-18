@@ -4,8 +4,20 @@ From jenosize.com/en/ideas to a served, evaluated LoRA adapter. It's written for
 an engineer, not a data scientist: every step is a command, every command can be
 re-run safely, and nothing lives only on a laptop.
 
+There are **two ways to drive it, sharing the same code**:
+
+| | Jobs API (on Modal) | CLI (`make …`) |
+|---|---|---|
+| Best for | Normal use: start a job, poll it, repeat | Development and debugging |
+| Runs where | Each job in its own Modal container, no time limit | Your terminal (GPU steps still on Modal) |
+| Tracks progress in | `job_runs` + `pipeline_runs` (Postgres) | `pipeline_runs` (Postgres) |
+
+The **article API on Vercel is separate** and never scrapes or trains. The two
+services only share the database and the bucket.
+
 ```
-                 ┌──────────────── your machine (CPU, cheap) ────────────────┐
+   POST /v1/scrape · /v1/label · /v1/datasets  (jobs API on Modal, or `make` locally)
+                 ┌──────────── Modal job worker (CPU, cheap) ────────────────┐
 jenosize.com ──► │ scrape ──► clean ──► label ──► build_dataset              │
   (sitemaps)     └────┬──────────┬────────┬────────────┬─────────────────────┘
                       │          │        │            │
@@ -16,7 +28,7 @@ jenosize.com ──► │ scrape ──► clean ──► label ──► buil
             │ raw/scrape/...  │  │ training_articles            │
             │ datasets/v1/... │  │ pipeline_runs  dataset_versions
             └────────┬────────┘  └──────────────────────────────┘
-                     │ r2://datasets/v1/train.jsonl
+                     │ r2://datasets/v1/train.jsonl     POST /v1/train · /v1/eval
                      ▼
             ┌──────────────── Modal (GPU, pay per second) ───────────────┐
             │ train.py (L4, QLoRA) ──► Volume jeno-models/jeno-lora-v1    │
@@ -40,6 +52,7 @@ done), R2 holds *bytes* (raw pages, published datasets), Modal holds *GPU work*.
 | Any OpenAI-compatible LLM | For reverse-labelling (~150 short calls) | `.env` → `LABELER_BASE_URL`, `LABELER_API_KEY`, `LABELER_MODEL` |
 | Hugging Face | A token with *write* access (to publish the adapter) | Modal secret `jeno-hf` |
 | Modal | `uv run modal setup` (browser login) | `~/.modal.toml` |
+| Jobs API key | `openssl rand -hex 24` | Modal secret `jeno-pipeline` → `JOBS_API_KEY` |
 
 Use Supabase's **Session pooler** URI rather than the direct connection. On the
 free plan the direct host is IPv6-only, and many home and office networks
@@ -54,14 +67,29 @@ cp .env.example .env                                  # fill in the values above
 make migrate                                          # creates all tables (idempotent)
 ```
 
-### Modal secrets (the GPU jobs read these, not your `.env`)
+### Modal secrets (jobs on Modal read these, not your `.env`)
 
 ```bash
-uv run modal secret create jeno-hf   HF_TOKEN=hf_...
-uv run modal secret create jeno-vllm VLLM_API_KEY=$(openssl rand -hex 24)
-uv run modal secret create jeno-r2   R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... \
-                                     R2_SECRET_ACCESS_KEY=... R2_BUCKET=jenosize-trend-writer
+uv run modal secret create jeno-hf       HF_TOKEN=hf_...
+uv run modal secret create jeno-vllm     VLLM_API_KEY=$(openssl rand -hex 24)
+uv run modal secret create jeno-r2       R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... \
+                                         R2_SECRET_ACCESS_KEY=... R2_BUCKET=jenosize-trend-writer
+uv run modal secret create jeno-pipeline DATABASE_URL=postgresql://... JOBS_API_KEY=... \
+                                         LABELER_BASE_URL=... LABELER_API_KEY=... LABELER_MODEL=...
 ```
+
+### Check, then deploy
+
+```bash
+make modal-doctor    # from inside Modal: imports, secrets, Postgres, R2 (~1 cent)
+make deploy-modal    # jobs API + vLLM server + train/eval, all in one deploy
+```
+
+`make modal-doctor` is worth the 20 seconds. It catches a missing secret or an
+unreachable database before a GPU job spends a cold start finding out.
+`make deploy-modal` prints the jobs API URL, which is
+`https://<workspace>--jenosize-trend-writer-jobs-api.modal.run`, with Swagger at
+`/docs`.
 
 Don't `pip install modal`. Homebrew's Python refuses system-wide installs, and
 the `modal` uv group keeps the CLI out of the Vercel bundle. Prefix every Modal
@@ -69,7 +97,39 @@ command with `uv run`.
 
 ---
 
-## 1. Gather the articles: `make scrape` (~4 min the first time)
+## The jobs API in one screen
+
+```bash
+JOBS=https://<workspace>--jenosize-trend-writer-jobs-api.modal.run
+KEY="X-API-Key: $JOBS_API_KEY"
+
+curl -X POST $JOBS/v1/scrape -H "$KEY"                         # 202 {"id": ..., "status": "queued"}
+curl       $JOBS/v1/runs/<id> -H "$KEY"                        # status, result, per-stage stats
+curl -X POST $JOBS/v1/label   -H "$KEY"                        # 202
+curl -X POST $JOBS/v1/datasets -H "$KEY" -d '{"version":"v1"}' # 201 published | 200 unchanged | 409 exists
+curl -X POST $JOBS/v1/train   -H "$KEY" -d '{"version":"v1"}'  # 202, GPU job ~15-30 min
+curl -X POST $JOBS/v1/eval    -H "$KEY" -d '{"version":"v1","endpoint":"https://.../v1"}'
+curl       $JOBS/v1/corpus    -H "$KEY"                        # counts per stage
+curl -X POST $JOBS/v1/runs/<id>/cancel -H "$KEY"
+```
+(POSTs with a body also need `-H 'Content-Type: application/json'`.)
+
+| Behaviour | Why |
+|---|---|
+| Returns `202` immediately; poll `GET /v1/runs/{id}` | Jobs take minutes, and HTTP requests shouldn't |
+| **One active job per kind** (`409` otherwise), enforced by a unique index | Two crawls would double-fetch every page; two trainings would race for the same adapter directory |
+| A worker that dies without reporting is marked `failed` on the next read | A crashed job must not block new ones forever |
+| Refuses every request if `JOBS_API_KEY` is unset | These endpoints spend GPU time and labelling budget |
+| `delay_s` has a floor of 0.5 s | The API must not be usable to hammer jenosize.com |
+| `POST /v1/train` returns `404` unless the dataset version is published | Training on nothing wastes a GPU cold start |
+
+For local development, `make jobs-dev` runs the same API on
+`http://localhost:8001`. Scrape and label run in-process against your real
+Postgres and R2; train and eval need Modal.
+
+---
+
+## 1. Gather the articles: `POST /v1/scrape` or `make scrape` (~4 min the first time)
 
 ```bash
 make scrape      # = pipeline.scrape discover + pipeline.scrape crawl
@@ -122,7 +182,7 @@ so just re-run.
 
 ---
 
-## 2. Clean: `make clean` (~seconds)
+## 2. Clean: part of every scrape job, or `make clean` (~seconds)
 
 Reads raw HTML **from R2** and writes `clean_markdown` to Postgres. It only
 processes articles whose fingerprint changed, or all of them after a rules
@@ -150,7 +210,7 @@ uv run python -m pipeline.clean stats     # counts, word distribution, categorie
 
 ---
 
-## 3. Reverse-label: `make label` (~2–5 min, a few cents)
+## 3. Reverse-label: `POST /v1/label` or `make label` (~2–5 min, a few cents)
 
 The corpus has articles but no briefs, and training needs *(brief → article)*
 pairs. An LLM reads each finished article and infers the brief that would have
@@ -175,7 +235,7 @@ labelled. **Changed the labelling prompt?** Bump `LABEL_VERSION` in
 
 ---
 
-## 4. Publish a dataset: `make dataset VERSION=v1` (~seconds)
+## 4. Publish a dataset: `POST /v1/datasets` or `make dataset VERSION=v1` (~seconds)
 
 Renders every usable article through `app/services/prompt.py`, **the same
 code the API uses at inference**. `tests/test_pipeline_dataset.py` fails if the
@@ -204,9 +264,11 @@ an existing one between splits. Moving one would leak eval data into training.
 
 ---
 
-## 5. Train on Modal: `make train VERSION=v1` (~15–30 min on an L4)
+## 5. Train on Modal: `POST /v1/train` or `make train VERSION=v1` (~15–30 min on an L4)
 
 ```bash
+curl -X POST $JOBS/v1/train -H "$KEY" -H 'Content-Type: application/json' -d '{"version":"v1"}'
+# or
 make train VERSION=v1
 ```
 
@@ -220,12 +282,10 @@ Your machine only submits the job. Modal starts an L4 GPU, runs
 | Schedule | lr 2e-4, 3 epochs, effective batch 8, max 4096 tokens | Standard QLoRA recipe; change it only on eval evidence |
 | Loss | **Assistant turn only** (masked via Qwen's ChatML markers, verified against the model's template) | Otherwise it learns to write *briefs* |
 
-The adapter is saved to the Modal volume `jeno-models` at `/models/jeno-lora-v1`.
-To also publish it to Hugging Face:
-
-```bash
-uv run modal run modal/train.py --dataset-uri r2://datasets/v1/train.jsonl --push-to-hub
-```
+The adapter is saved to the Modal volume `jeno-models` at
+`/models/jeno-lora-{version}`, **one directory per dataset version**, so
+training v2 never overwrites v1. To also publish it to Hugging Face, send
+`"push_to_hub": true` or run `make train VERSION=v1` with `--push-to-hub`.
 
 The first run is slower (~10 min extra) because it builds the image and
 downloads the 8 GB base model into a cache volume. Later runs reuse both.
@@ -235,8 +295,9 @@ downloads the 8 GB base model into a cache volume. Later runs reuse both.
 ## 6. Serve and evaluate
 
 ```bash
-make serve                                  # prints https://<ws>--jenosize-trend-writer-vllmserver.modal.run
-make eval ENDPOINT=https://<that-url>/v1 VERSION=v1
+make deploy-modal ADAPTER=v1               # serves /models/jeno-lora-v1 (redeploy with ADAPTER=v2 to switch)
+curl -X POST $JOBS/v1/eval -H "$KEY" -H 'Content-Type: application/json' \
+     -d '{"version":"v1","endpoint":"https://<ws>--jenosize-trend-writer-vllmserver.modal.run/v1"}'
 ```
 
 `serve.py` runs one vLLM server holding **both** the base model and the LoRA,
@@ -262,10 +323,12 @@ Then point the API at the endpoint: `MODEL_PROVIDER=openai_compatible`,
 ## Re-running later (new articles on the site)
 
 ```bash
-make pipeline               # scrape + clean + label, only what's new
-make dataset VERSION=v2     # "unchanged" if nothing new; otherwise a new immutable version
-make train VERSION=v2
-make eval ENDPOINT=... VERSION=v2
+POST /v1/scrape                      # only new/changed articles are written
+POST /v1/label                       # only new/changed articles are labelled
+POST /v1/datasets {"version":"v2"}   # 200 "unchanged" if nothing new, else 201 published
+POST /v1/train    {"version":"v2"}   # adapter -> /models/jeno-lora-v2 (v1 untouched)
+make deploy-modal ADAPTER=v2         # serve the new adapter
+POST /v1/eval     {"version":"v2", "endpoint": ...}
 ```
 
 Every stage is incremental and every run is logged in `pipeline_runs`, so
@@ -282,7 +345,8 @@ through logs.
 | Run history | Postgres `pipeline_runs` |
 | Published dataset versions | Postgres `dataset_versions` + R2 `datasets/{version}/` |
 | Raw HTML (every distinct version) | R2 `raw/scrape/{date}/{fingerprint}.html` |
-| Trained adapter | Modal volume `jeno-models` → `/models/jeno-lora-v1` (+ HF Hub) |
+| Trained adapters | Modal volume `jeno-models` → `/models/jeno-lora-{version}` (+ HF Hub) |
+| Job history | Postgres `job_runs` (linked to its stages in `pipeline_runs`) |
 | Base-model cache | Modal volume `jeno-hf-cache` |
 
 ## Troubleshooting
@@ -296,3 +360,7 @@ through logs.
 | `validate` reports "no '##' sections" | A new page layout. Inspect it, adjust `pipeline/clean.py`, bump `CLEAN_VERSION` |
 | Training fails while building the image | Unsloth and TRL move fast. Pin `unsloth==<last good>` in `modal/common.py` |
 | `modal: command not found` | Use `uv run modal …` |
+| Jobs API returns `503 not_configured` | `JOBS_API_KEY` or `DATABASE_URL` missing from the `jeno-pipeline` Modal secret |
+| `409 job_already_active` | One job per kind at a time. Poll the `run_id` in the response, or cancel it |
+| A job stuck in `running` | `GET /v1/runs/{id}` reconciles it against Modal; a dead worker is marked `failed` |
+| Anything on Modal fails at import | Run `make modal-doctor`; it names the missing secret or module |

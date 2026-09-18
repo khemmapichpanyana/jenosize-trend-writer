@@ -47,6 +47,14 @@ without it.
 
 ## Architecture
 
+Two services, one database and one bucket:
+
+- **Article API (Vercel)** is the product. It generates articles and never
+  scrapes or trains.
+- **Jobs API (Modal)** does operations: scrape, label, publish datasets, train,
+  and evaluate. Every job runs in its own container with no time limit. See
+  [`docs/fine_tuning_workflow.md`](docs/fine_tuning_workflow.md).
+
 ```
 Client ──► Vercel: FastAPI backend (trend-writer.workser.app)
               │  /api/v1/*   API
@@ -129,8 +137,8 @@ app/
     ingest.py        ✅ URL → trafilatura · PDF/DOCX/TXT → text
   db/                Repository protocol · NullRepository · SupabaseRepository
   storage/           Storage protocol · LocalStorage · R2Storage · key conventions
-pipeline/            ✅ scrape · clean · label · build_dataset · migrate (Postgres + R2, incremental)
-modal/               ✅ common · train (Unsloth QLoRA) · serve (vLLM + LoRA) · eval (base vs FT)
+pipeline/            ✅ scrape · clean · label · build_dataset · jobs · api (jobs API) · migrate
+modal/               ✅ jobs API · train (QLoRA) · serve (vLLM + LoRA) · eval · doctor · deploy
 supabase/migrations/ 0001_init.sql — 7 tables, RLS enabled, no policies
 tests/               services · API (mock) · pipeline on real Postgres + S3 · prompt parity
 docs/                architecture.md · report.md (outline) · data_card.md (template)
@@ -197,11 +205,15 @@ bypasses RLS; it must never reach a browser.
 setup to scraping, cleaning, labelling, dataset, training, serving and eval.
 
 ```bash
-make install && make migrate          # once
-make pipeline                         # scrape -> clean -> label   (Postgres + R2)
-make dataset VERSION=v1               # immutable, validated, published to R2
-make train   VERSION=v1               # QLoRA on a Modal L4
-make serve && make eval ENDPOINT=https://<url>/v1 VERSION=v1
+make install && make migrate && make modal-doctor && make deploy-modal   # once
+
+# then, via the jobs API (or the equivalent make targets):
+POST /v1/scrape                     # pull new articles        (make scrape)
+POST /v1/label                      # reverse-label            (make label)
+POST /v1/datasets {"version":"v1"}  # publish immutable v1     (make dataset VERSION=v1)
+POST /v1/train    {"version":"v1"}  # QLoRA on a Modal L4      (make train VERSION=v1)
+POST /v1/eval     {"version":"v1", "endpoint": "<vllm>/v1"}
+GET  /v1/runs/{id}                  # status + per-stage stats
 ```
 
 The data pipeline writes **only to Postgres (`DATABASE_URL`) and Cloudflare

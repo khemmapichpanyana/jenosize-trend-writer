@@ -14,6 +14,8 @@ genuinely shadow the SDK.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import modal
 
 APP_NAME = "jenosize-trend-writer"
@@ -29,9 +31,12 @@ BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 #   jeno-vllm  -> VLLM_API_KEY    (bearer token the FastAPI backend sends)
 #   jeno-r2    -> R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 #                 (so training reads datasets/ straight from object storage)
+#   jeno-pipeline -> DATABASE_URL, JOBS_API_KEY, LABELER_BASE_URL,
+#                    LABELER_API_KEY, LABELER_MODEL (the jobs API + workers)
 HF_SECRET_NAME = "jeno-hf"
 VLLM_SECRET_NAME = "jeno-vllm"
 R2_SECRET_NAME = "jeno-r2"
+PIPELINE_SECRET_NAME = "jeno-pipeline"
 
 MINUTES = 60
 
@@ -44,6 +49,7 @@ hf_cache_volume = modal.Volume.from_name("jeno-hf-cache", create_if_missing=True
 hf_secret = modal.Secret.from_name(HF_SECRET_NAME)
 vllm_secret = modal.Secret.from_name(VLLM_SECRET_NAME)
 r2_secret = modal.Secret.from_name(R2_SECRET_NAME)
+pipeline_secret = modal.Secret.from_name(PIPELINE_SECRET_NAME)
 
 VOLUMES = {
     "/models": models_volume,
@@ -53,8 +59,15 @@ VOLUMES = {
 # --------------------------------------------------------------------------- #
 # Images
 # --------------------------------------------------------------------------- #
+# Modal uploads only the file a function is defined in (checked in the SDK:
+# `get_entrypoint_mount`). Every function here imports this `common` module at
+# the top, so each image adds it explicitly — without that, containers fail at
+# import with `ModuleNotFoundError: common` before doing any work.
+#
 # Training and serving are split because Unsloth and vLLM pin conflicting
 # torch/transformers versions; a single image would force a compromise on both.
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 train_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -76,21 +89,25 @@ train_image = (
         "boto3",  # read datasets/v1/train.jsonl straight from R2
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .add_local_python_source("common")
 )
 
 serve_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("vllm==0.11.0", "huggingface_hub>=0.26.0")
-    .env(
-        {
-            # Keeps cold starts honest: without this vLLM spends minutes on
-            # CUDA-graph capture that a scale-to-zero service never amortises.
-            "VLLM_USE_V1": "1",
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        }
-    )
+    # hf_transfer must be installed whenever HF_HUB_ENABLE_HF_TRANSFER=1, or
+    # huggingface_hub refuses to download at all.
+    .uv_pip_install("vllm==0.11.0", "huggingface_hub>=0.26.0", "hf_transfer")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .add_local_python_source("common")
 )
 
-eval_image = modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-    "openai>=1.54.0", "boto3>=1.35.0", "datasets>=3.0.0"
+# CPU image for everything that runs this repo's own code: the jobs API, job
+# workers and eval. Built from the same requirements.txt Vercel installs, plus
+# the pipeline's Postgres driver, so "works locally" and "works on Modal" share
+# one dependency list.
+app_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install_from_requirements(str(REPO_ROOT / "requirements.txt"))
+    .uv_pip_install("psycopg[binary]>=3.2.0")
+    .add_local_python_source("app", "pipeline", "common")
 )

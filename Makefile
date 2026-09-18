@@ -29,3 +29,35 @@ smoke:  ## Smoke-test a running deployment: make smoke URL=https://...
 	./scripts/smoke_test.sh $(URL)
 
 .PHONY: help install dev test lint fmt reqs smoke
+
+# --- data pipeline (Day 1) ---------------------------------------------------
+corpus:  ## Full corpus build: discover -> crawl -> clean -> stats
+	$(UV) run python -m pipeline.scrape discover
+	$(UV) run python -m pipeline.scrape crawl
+	$(UV) run python -m pipeline.clean run
+	$(UV) run python -m pipeline.clean stats
+
+label:  ## Reverse-label the cleaned corpus (needs LABELER_* in .env)
+	$(UV) run python -m pipeline.label run
+
+dataset:  ## Build and validate train/eval JSONL: make dataset VERSION=v1
+	$(UV) run python -m pipeline.build_dataset run --version $(or $(VERSION),v1)
+	$(UV) run python -m pipeline.build_dataset validate --version $(or $(VERSION),v1)
+
+corpus-status:  ## How far the corpus has progressed
+	$(UV) run python -m pipeline.scrape status
+
+# --- GPU jobs (Day 2) --------------------------------------------------------
+modal-setup:  ## Authenticate the Modal CLI (opens a browser)
+	$(UV) run modal setup
+
+train:  ## Fine-tune on Modal: make train DATASET=r2://datasets/v1/train.jsonl
+	$(UV) run modal run modal/train.py --dataset-uri $(or $(DATASET),r2://datasets/v1/train.jsonl)
+
+serve:  ## Deploy the vLLM server on Modal and print its URL
+	$(UV) run modal deploy modal/serve.py
+
+eval:  ## Base vs fine-tuned: make eval ENDPOINT=https://...modal.run/v1
+	$(UV) run modal run modal/eval.py --endpoint $(ENDPOINT)
+
+.PHONY: corpus label dataset corpus-status modal-setup train serve eval

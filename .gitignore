@@ -11,7 +11,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.data/            # local storage backend writes here
+# local storage backend + pipeline corpus (scraped third-party HTML: never commit)
+.data/
 .vercel/
 .modal/
 

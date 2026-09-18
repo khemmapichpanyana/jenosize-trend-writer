@@ -39,7 +39,7 @@ curl -N localhost:8000/api/v1/articles/stream -H 'Content-Type: application/json
   -d '{"topic":"The future of embedded finance","industry":"fintech","length":"short"}'
 ```
 
-`make lint test` runs ruff + mypy + the 58-test suite.
+`make lint test` runs ruff + mypy + the test suite (113 tests).
 
 ---
 
@@ -127,10 +127,10 @@ app/
     ingest.py        ✅ URL → trafilatura · PDF/DOCX/TXT → text
   db/                Repository protocol · NullRepository · SupabaseRepository
   storage/           Storage protocol · LocalStorage · R2Storage · key conventions
-pipeline/            🚧 stubs — scrape · clean · label · build_dataset (typer CLIs)
-modal/               🚧 skeletons — common · train (Unsloth LoRA) · serve (vLLM) · eval
+pipeline/            ✅ scrape · clean · label · build_dataset (typer CLIs, resumable)
+modal/               ✅ common · train (Unsloth QLoRA) · serve (vLLM + LoRA) · eval (base vs FT)
 supabase/migrations/ 0001_init.sql — 7 tables, RLS enabled, no policies
-tests/               58 tests: normalize · retrieve · quality · API (mock, ASGI transport)
+tests/               113 tests: services · API (mock, ASGI) · pipeline · train/inference prompt parity
 docs/                architecture.md · report.md (outline) · data_card.md (template)
 scripts/             smoke_test.sh · gen_requirements.sh
 ```
@@ -142,11 +142,12 @@ transports, normalization, chunking + BM25 retrieval, the quality gate with its
 retry, ingestion of URLs and documents, all three seams with every
 implementation, the SQL schema, structured logging, the error model, CI.
 
-**Stubbed** — `pipeline/*` (CLI shape and docstrings final, bodies are TODO),
-`modal/train.py` (plumbing runnable, the Unsloth training call is TODO),
-`modal/eval.py` (metrics defined, scoring TODO). `prompt.STYLE_RULES` is written
-from a skim of the corpus and gets replaced by Day 1's labelling output. The
-browser demo page is not in this repo yet.
+**Implemented but not yet run at full scale** — the data pipeline has been run
+against the live site on a 12-article sample (discover → crawl → clean →
+build → validate all pass); labelling needs your `LABELER_*` endpoint. The Modal
+jobs (`train.py`, `serve.py`, `eval.py`) import and construct cleanly against
+Modal 1.5.5 but have not executed on a GPU yet. `prompt.STYLE_RULES` is still a
+first draft. The browser demo page is not in this repo yet.
 
 ---
 
@@ -186,6 +187,54 @@ bypasses RLS; it must never reach a browser.
 
 ---
 
+## Fine-tuning runbook
+
+The whole path from website to adapter. Every stage is resumable: state lives
+in `.data/corpus.db` (or `training_articles` with `PERSISTENCE=supabase`), so a
+failed run is re-run, not restarted.
+
+```bash
+# 0. one-time
+uv sync --group dev --group modal
+uv run modal setup                          # browser login
+
+# 1. corpus (~3-5 min for 174 articles at 1 req/s)
+make corpus                                 # discover -> crawl -> clean -> stats
+
+# 2. reverse-label (any OpenAI-compatible model; set LABELER_* in .env)
+uv run python -m pipeline.label run --dry-run   # eyeball ONE label first
+make label
+uv run python -m pipeline.label audit --sample 10
+
+# 3. dataset
+make dataset VERSION=v1                     # build + validate; writes the data card
+
+# 4. train on Modal (L4, QLoRA r=16, 3 epochs)
+make train DATASET=r2://datasets/v1/train.jsonl
+#   no R2 yet? copy the file into the volume and point at it:
+#   uv run modal volume put jeno-models .data/datasets/v1/train.jsonl /datasets/v1/train.jsonl
+#   make train DATASET=/models/datasets/v1/train.jsonl
+
+# 5. serve + evaluate
+make serve                                  # prints the vLLM URL
+make eval ENDPOINT=https://<ws>--jenosize-trend-writer-vllmserver.modal.run/v1
+```
+
+Modal secrets the jobs expect: `jeno-hf` (`HF_TOKEN`), `jeno-vllm`
+(`VLLM_API_KEY`), `jeno-r2` (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`, `R2_BUCKET`).
+
+### What the data pipeline does, and why
+
+| Stage | Key decisions |
+|---|---|
+| **scrape** | robots.txt honoured, 1 req/s, raw HTML archived *before* parsing. `category` comes free from the URL path (`/en/ideas/{category}/{slug}`), and title + meta description come from the page itself, so they are real training targets. |
+| **clean** | Headings remapped relative to each article's shallowest level (the site mixes `<h4>` and `<h5>` layouts). CTA and **reference sections are dropped whole**, because a model that learns to write bibliographies makes up sources at inference. Near-duplicates are flagged by 5-gram shingle Jaccard, not deleted. |
+| **label** | An LLM infers topic / industry / audience / keywords from the finished article. Category, language and length are **derived, not inferred**. Every inferred field goes through the API's own normalizers. |
+| **build** | Rendered through `app/services/prompt.py`, the same code the API calls. `tests/test_pipeline_dataset.py` asserts the two prompts are **byte-identical**. Split by `sha256(url)` so adding articles never moves one across train/eval. |
+
+---
+
 ## Deployment
 
 ### Vercel (backend)
@@ -200,7 +249,8 @@ which is what Vercel installs).
 
 ### Supabase
 
-Apply `supabase/migrations/0001_init.sql` via the CLI or the SQL editor. Seven
+Apply `supabase/migrations/0001_init.sql` then `0002_training_article_fields.sql`
+via the CLI or the SQL editor. Seven
 tables, uuid PKs, jsonb for moving parts, indexes on `generations(created_at desc)`
 and `generations(status)`. **RLS is enabled on every table with no policies** —
 deny by default; only the service key gets through.
@@ -208,21 +258,26 @@ deny by default; only the service key gets through.
 ### Modal (GPU)
 
 ```bash
-modal setup
-modal secret create jeno-hf    HF_TOKEN=...
-modal secret create jeno-vllm  VLLM_API_KEY=...
-modal deploy modal/serve.py          # prints the URL for MODEL_BASE_URL
-modal run    modal/train.py --dataset-uri r2://datasets/v1/train.jsonl
+uv sync --group modal
+uv run modal setup
+uv run modal secret create jeno-hf    HF_TOKEN=...
+uv run modal secret create jeno-vllm  VLLM_API_KEY=...
+uv run modal secret create jeno-r2    R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=jenosize-trend-writer
+uv run modal deploy modal/serve.py   # prints the URL for MODEL_BASE_URL
 ```
 
 `serve.py` scales to zero (`min_containers=0`, `scaledown_window=5 min`). If the
 adapter directory does not exist yet it serves the base model and logs a warning,
 so the endpoint is usable before training lands.
 
-> The directory is named `modal/`, which shadows the installed `modal` package
-> when the repo root is on `sys.path`. `modal deploy modal/serve.py` is fine
-> (Python puts the script's own directory first); avoid `python -c "import modal"`
-> from the repo root.
+> The `modal/` directory has no `__init__.py`, so it is only a namespace-package
+> candidate, and Python prefers the real `modal` SDK from site-packages (checked:
+> `import modal` resolves correctly from the repo root). Don't add an
+> `__init__.py` there, because that would really shadow the SDK.
+>
+> Install the Modal CLI into the project venv with `uv sync --group modal`, not
+> `pip install modal`. Homebrew's Python refuses system-wide pip installs
+> (PEP 668), and the group keeps `modal` out of the Vercel bundle.
 
 ### Smoke test a deployment
 

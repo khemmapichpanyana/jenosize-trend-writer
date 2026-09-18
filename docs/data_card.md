@@ -1,8 +1,10 @@
 # Data Card — Jenosize Trend Writer training corpus
 
-> **Status: template.** Day 1's pipeline fills in every `TBD`.
-> `pipeline/clean.py stats` and `pipeline/build_dataset.py run` generate the
-> numbers; the file is published to R2 as `datasets/{version}/data_card.md`.
+> **Status: template.** `python -m pipeline.build_dataset run` now renders the
+> real card, with actual counts and distributions, to
+> `.data/datasets/{version}/data_card.md` and to R2 as
+> `datasets/{version}/data_card.md`. Copy that file over this one once the
+> v1 dataset is final.
 
 ## Dataset summary
 

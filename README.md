@@ -52,6 +52,7 @@ from the model's memory.
 | --- | --- |
 | [`ai-services/`](ai-services/README.md) | Python: FastAPI article API (`app/`), data pipeline (`pipeline/`), fine-tuning, serving and evaluation on Modal (`modal/`), the LangChain content agent (`studio/`), SQL schema, tests |
 | [`web/`](web/README.md) | Next.js 16 app: agent chat, article preview and publishing, pipeline/training/model dashboards, in-app docs |
+| [`evidence/`](evidence/README.md) | Fine-tuning evidence: the adapter weights, training loss curve and run records, base-vs-fine-tuned evaluation outputs |
 
 ## How it works
 
@@ -92,8 +93,9 @@ Details: [`ai-services/docs/architecture.md`](ai-services/docs/architecture.md),
 - The dataset files are **not in this public repo** because they contain full
   text of a third party's published articles. They are shared privately with the
   submission, and the pipeline above rebuilds them from the public site.
-- The v2 adapter was trained for 1 epoch (12 steps) at rank 16 and learning rate 1e-4.
-  Final train loss was 2.2831.
+- The v2 adapter was trained with QLoRA for 1 epoch (12 steps) at rank 16 and
+  learning rate 1e-4. Loss went from 2.71 to 1.98. **The weights, loss curve,
+  run records and every evaluation output are in [`evidence/`](evidence/README.md).**
 
 | On 13 held-out briefs | Base | Fine-tuned v2 |
 | --- | --- | --- |
@@ -102,6 +104,8 @@ Details: [`ai-services/docs/architecture.md`](ai-services/docs/architecture.md),
 | Mean words | 705 | 744 |
 | Mean H2 sections | 4.38 | 4.92 |
 
+An earlier v1 adapter (3 epochs, unfiltered data) scored only 15% and lost
+every judged comparison. v2's data filter and gentler schedule fixed that.
 This is a small, honest comparison. It shows v2 follows the house structure
 more reliably, but it does not prove general superiority. See the report for
 the judge results and limitations.

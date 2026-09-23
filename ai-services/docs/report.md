@@ -38,7 +38,9 @@ The active v2 adapter trained for **one epoch, 12 optimizer steps**, with LoRA
 rank 16 and learning rate `1e-4`; recorded final train loss was **2.2831**.
 Loss is not directly comparable to v1 because the corpus, quality filter,
 epoch count, and learning rate changed. The training and serving code, not a
-hosted third-party fine-tune, loads this adapter in vLLM.
+hosted third-party fine-tune, loads this adapter in vLLM. The adapter
+weights, the per-step loss curve (2.71 → 1.98), the run records and all 26
+evaluation outputs are published in the repository's `evidence/` folder.
 
 ## Evaluation and observed product flow
 

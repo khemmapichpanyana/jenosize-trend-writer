@@ -1,0 +1,8 @@
+{
+  "train_loss": 2.283124655485153,
+  "steps": 12,
+  "examples": 92,
+  "epochs": 1,
+  "lora_r": 16,
+  "learning_rate": 0.0001
+}

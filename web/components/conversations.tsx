@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { MessageSquare, Plus } from "lucide-react";
-import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
+import { Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
 import { ago } from "@/lib/format";
 import type { Thread } from "@/lib/types";
 
@@ -23,37 +23,41 @@ export function ConversationPalette({
   const router = useRouter();
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange} title="Conversations" description="Search conversations or start a new one">
-      <CommandInput placeholder="Search conversations…" />
-      <CommandList>
-        <CommandEmpty>No matching conversations.</CommandEmpty>
-        <CommandGroup>
-          <CommandItem
-            value="new conversation"
-            onSelect={() => {
-              onOpenChange(false);
-              onNew();
-            }}
-          >
-            <Plus /> New conversation
-          </CommandItem>
-        </CommandGroup>
-        <CommandGroup heading="Recent">
-          {(threads ?? []).map((t) => (
+      {/* shadcn's CommandDialog no longer wraps children in <Command>; without it
+          CommandInput has no cmdk store and throws on open. */}
+      <Command>
+        <CommandInput placeholder="Search conversations…" />
+        <CommandList>
+          <CommandEmpty>No matching conversations.</CommandEmpty>
+          <CommandGroup>
             <CommandItem
-              key={t.id}
-              value={`${t.title} ${t.id}`}
+              value="new conversation"
               onSelect={() => {
                 onOpenChange(false);
-                router.push(`/studio/${t.id}`);
+                onNew();
               }}
             >
-              <MessageSquare />
-              <span className="min-w-0 truncate">{t.title}</span>
-              {t.id === currentId ? <CommandShortcut>current</CommandShortcut> : <CommandShortcut>{ago(t.updated_at)}</CommandShortcut>}
+              <Plus /> New conversation
             </CommandItem>
-          ))}
-        </CommandGroup>
-      </CommandList>
+          </CommandGroup>
+          <CommandGroup heading="Recent">
+            {(threads ?? []).map((t) => (
+              <CommandItem
+                key={t.id}
+                value={`${t.title} ${t.id}`}
+                onSelect={() => {
+                  onOpenChange(false);
+                  router.push(`/studio/${t.id}`);
+                }}
+              >
+                <MessageSquare />
+                <span className="min-w-0 truncate">{t.title}</span>
+                {t.id === currentId ? <CommandShortcut>current</CommandShortcut> : <CommandShortcut>{ago(t.updated_at)}</CommandShortcut>}
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        </CommandList>
+      </Command>
     </CommandDialog>
   );
 }

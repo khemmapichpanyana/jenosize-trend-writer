@@ -1,0 +1,44 @@
+/*
+  Jenosize page theme — placeholder tokens sampled from jenosize.com
+  (accent #00BCCE, slate #808F99, mist #EBEDEF). Swap for the official palette
+  and typefaces; the page shell and the agent's markup only use these classes.
+*/
+:root {
+  --jz-accent: #00bcce;
+  --jz-accent-ink: #006f7a;
+  --jz-ink: #14212b;
+  --jz-muted: #5b6a75;
+  --jz-slate: #808f99;
+  --jz-mist: #ebedef;
+  --jz-paper: #ffffff;
+  --jz-font: "Inter", "Noto Sans Thai", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --jz-measure: 44rem;
+}
+/* jenosize.com is a light-only brand — the article page never follows the
+   viewer's OS dark-mode preference. */
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--jz-paper); color: var(--jz-ink); font-family: var(--jz-font); line-height: 1.65; }
+.jz-bar { border-bottom: 1px solid var(--jz-mist); }
+.jz-bar__inner { max-width: 64rem; margin: 0 auto; padding: .75rem 1.25rem; display: flex; align-items: center; justify-content: space-between; }
+.jz-logo { display: block; height: 28px; width: auto; }
+.jz-tag { font-size: .8rem; color: var(--jz-muted); text-transform: uppercase; letter-spacing: .12em; }
+.jz-article { max-width: var(--jz-measure); margin: 0 auto; padding: 1.75rem 1.25rem 3rem; }
+.jz-article h1 { font-size: clamp(1.5rem, 2.6vw, 2rem); line-height: 1.2; margin: 0 0 .75rem; letter-spacing: -.01em; }
+.jz-article h2 { font-size: 1.2rem; margin: 1.8rem 0 .6rem; padding-top: .35rem; border-top: 3px solid var(--jz-accent); display: inline-block; }
+.jz-article h3 { font-size: 1.02rem; margin: 1.4rem 0 .4rem; }
+.jz-article p, .jz-article li { font-size: .95rem; }
+.jz-article a { color: var(--jz-accent-ink); }
+.jz-standfirst { font-size: 1.05rem !important; color: var(--jz-muted); margin-bottom: 1.5rem; }
+.jz-hero { margin: 0 0 1.5rem; }
+.jz-hero img, .jz-figure img { width: 100%; height: auto; border-radius: 12px; display: block; }
+.jz-figure { margin: 1.5rem 0; }
+.jz-figure figcaption, .jz-hero figcaption { font-size: .8rem; color: var(--jz-muted); margin-top: .4rem; }
+.jz-quote { margin: 1.5rem 0; padding: .85rem 1.25rem; border-left: 4px solid var(--jz-accent); font-size: 1.1rem; font-weight: 600; }
+.jz-callout { margin: 1.5rem 0; padding: 1rem 1.25rem; background: var(--jz-mist); border-radius: 12px; }
+.jz-actions { margin: 2rem 0 0; padding: 1.25rem; border: 1px solid var(--jz-mist); border-radius: 12px; }
+.jz-actions h2 { border: 0; margin-top: 0; }
+.jz-foot { border-top: 1px solid var(--jz-mist); color: var(--jz-muted); font-size: .85rem; }
+.jz-foot__inner { max-width: 64rem; margin: 0 auto; padding: 1.5rem 1.25rem; }
+table { border-collapse: collapse; width: 100%; margin: 1.5rem 0; }
+th, td { border-bottom: 1px solid var(--jz-mist); padding: .55rem .5rem; text-align: left; }

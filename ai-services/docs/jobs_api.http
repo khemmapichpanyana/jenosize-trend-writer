@@ -1,0 +1,172 @@
+### Jenosize Trend Writer — Jobs API, the whole fine-tuning workflow over HTTP.
+###
+### Run a request with "Send Request" in VS Code (REST Client extension) or
+### the ▶ gutter icon in JetBrains IDEs. Set the two variables first:
+###   @jobs  the URL printed by `make deploy-modal` (or http://localhost:8001 for `make jobs-dev`)
+###   @key   your JOBS_API_KEY
+### Jobs answer 202 with an "id": paste it into @run and poll "Run status".
+
+@jobs = https://<workspace>--jenosize-trend-writer-jobs-api.modal.run
+@key = <JOBS_API_KEY>
+@run = <run id from a 202 response>
+@vllm = https://<workspace>--jenosize-trend-writer-vllmserver.modal.run
+
+### ─────────────────────────── 0. Setup (once) ───────────────────────────
+
+### Liveness (no key needed)
+GET {{jobs}}/health
+
+### What the server resolved from its secrets (hosts and names, never values)
+GET {{jobs}}/v1/config
+X-API-Key: {{key}}
+
+### Every dependency, live: database + migrations, R2, labeller, adapters
+GET {{jobs}}/v1/doctor
+X-API-Key: {{key}}
+
+### Which migrations are applied
+GET {{jobs}}/v1/migrations
+X-API-Key: {{key}}
+
+### Apply pending migrations (idempotent)
+POST {{jobs}}/v1/migrations/apply
+X-API-Key: {{key}}
+
+### ─────────────────────────── 1. Pull data ───────────────────────────
+
+### Scrape: discover -> crawl -> clean. Only new/changed articles are written.
+POST {{jobs}}/v1/scrape
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{}
+
+### Re-check pages older than N days, to catch edits (0 = all of them)
+POST {{jobs}}/v1/scrape
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"recheck_days": 30}
+
+### Run status: result + per-stage stats (discover / crawl / clean)
+GET {{jobs}}/v1/runs/{{run}}
+X-API-Key: {{key}}
+
+### Recent runs (filter with ?kind=scrape|label|train|eval)
+GET {{jobs}}/v1/runs?limit=10
+X-API-Key: {{key}}
+
+### Cancel a run
+POST {{jobs}}/v1/runs/{{run}}/cancel
+X-API-Key: {{key}}
+
+### ─────────────────────────── 2. Inspect the corpus ───────────────────────────
+
+### Progress per stage + last stage runs
+GET {{jobs}}/v1/corpus
+X-API-Key: {{key}}
+
+### Word counts, categories, and why articles were rejected
+GET {{jobs}}/v1/corpus/stats
+X-API-Key: {{key}}
+
+### Page through articles: state = all|pending|fetched|cleaned|rejected|duplicates|labelled
+GET {{jobs}}/v1/corpus/articles?state=rejected&limit=20
+X-API-Key: {{key}}
+
+### One article in full: cleaned markdown, labels, signed link to the raw HTML
+GET {{jobs}}/v1/corpus/article?url=https://www.jenosize.com/en/ideas/futurist/agentic-ai-guide-for-modern-business
+X-API-Key: {{key}}
+
+### Random cleaned articles for review (same seed = same sample)
+GET {{jobs}}/v1/corpus/sample?n=3
+X-API-Key: {{key}}
+
+### ─────────────────────────── 3. Labels ───────────────────────────
+
+### Label ONE article without saving: check the prompt before paying for a run
+POST {{jobs}}/v1/label/preview
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{}
+
+### Label every new/changed article
+POST {{jobs}}/v1/label
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{}
+
+### Label audit: random labelled articles with their briefs
+GET {{jobs}}/v1/corpus/sample?n=10&labelled=true
+X-API-Key: {{key}}
+
+### ─────────────────────────── 4. Dataset ───────────────────────────
+
+### Publish v1 (201 published · 200 unchanged · 409 exists with other contents)
+POST {{jobs}}/v1/datasets
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"version": "v1", "eval_frac": 0.1}
+
+### Published versions
+GET {{jobs}}/v1/datasets
+X-API-Key: {{key}}
+
+### Re-validate v1 from R2
+GET {{jobs}}/v1/datasets/v1/validate
+X-API-Key: {{key}}
+
+### The data card (markdown)
+GET {{jobs}}/v1/datasets/v1/card
+X-API-Key: {{key}}
+
+### Two rows exactly as the trainer sees them
+GET {{jobs}}/v1/datasets/v1/examples?split=train&n=2
+X-API-Key: {{key}}
+
+### ─────────────────────────── 5. Train ───────────────────────────
+
+### Cheap first run: 1 epoch, to prove the GPU path (~$0.50)
+POST {{jobs}}/v1/train
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"version": "v1", "epochs": 1}
+
+### Full run (writes /models/jeno-lora-v1)
+POST {{jobs}}/v1/train
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"version": "v1", "epochs": 3, "lora_r": 16, "learning_rate": 0.0002}
+
+### Trained adapters + their training metrics
+GET {{jobs}}/v1/adapters
+X-API-Key: {{key}}
+
+### ─────────────────────────── 6. Serve & evaluate ───────────────────────────
+
+### Point the `jeno-lora` alias at v1 (next vLLM cold start; jeno-lora-v1 works immediately)
+POST {{jobs}}/v1/adapters/v1/activate
+X-API-Key: {{key}}
+
+### vLLM lists the base model + jeno-lora-v1 + jeno-lora (first call cold-starts 1-3 min)
+GET {{vllm}}/v1/models
+Authorization: Bearer <VLLM_API_KEY>
+
+### Base vs jeno-lora-v1 on v1's held-out briefs
+POST {{jobs}}/v1/eval
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"version": "v1", "endpoint": "{{vllm}}/v1"}
+
+### Same, plus a blind judge (the labelling LLM grades base vs fine-tuned)
+POST {{jobs}}/v1/eval
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"version": "v1", "endpoint": "{{vllm}}/v1", "judge": true}

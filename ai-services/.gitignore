@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Secrets & local state
+.env
+.env.*
+!.env.example
+# local storage backend + pipeline corpus (scraped third-party HTML: never commit)
+.data/
+.vercel/
+.modal/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local scratch / agent tooling
+tmp/
+.agents/
+*.numbers

@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    # A disposable Postgres for the pipeline's integration tests. The pipeline's
+    # correctness lives in SQL ("which rows changed since the last run?"), so it
+    # is tested against the real thing, not a mock.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jeno_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/jeno_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --group dev --group pipeline --group agent --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+      - name: Test (incl. Postgres + S3-compatible R2 integration)
+        run: uv run pytest
+
+      # The whole point of the mock provider: CI proves the service generates an
+      # article end to end without a GPU, a database or an object store.
+      - name: Smoke test (mock provider)
+        env:
+          MODEL_PROVIDER: mock
+          PERSISTENCE: none
+          STORAGE: local
+        run: |
+          uv run uvicorn app.main:app --port 8777 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8777/api/v1/health >/dev/null && break
+            sleep 1
+          done
+          ./scripts/smoke_test.sh http://localhost:8777
+
+      - name: Check the Vercel bundle stays light
+        run: |
+          if grep -Eiq '^(torch|transformers|unsloth|trl|vllm|bitsandbytes|modal|psycopg)([=<>~[]|$)' requirements.txt; then
+            echo "::error::a non-runtime dependency leaked into requirements.txt (Vercel 500 MB limit)"
+            exit 1
+          fi

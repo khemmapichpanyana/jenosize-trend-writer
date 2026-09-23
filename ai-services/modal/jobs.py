@@ -168,3 +168,17 @@ def jobs_api():  # type: ignore[no-untyped-def]
     from pipeline.api import create_jobs_app
 
     return create_jobs_app(ModalDispatcher())
+
+
+@app.function(image=app_image, secrets=[r2_secret, pipeline_secret], min_containers=1)
+@modal.concurrent(max_inputs=20)
+@modal.asgi_app(label="jenosize-trend-writer-article-api")
+def article_api():  # type: ignore[no-untyped-def]
+    """The public article API: POST a topic/parameters, get an article back.
+
+    Same FastAPI app as `make dev` (`app.main`), configured from the Modal
+    secret, so it writes with the fine-tuned `jeno-lora` adapter on vLLM.
+    """
+    from app.main import create_app
+
+    return create_app()

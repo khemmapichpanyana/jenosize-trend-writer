@@ -12,7 +12,7 @@ const STATUS: Record<JobStatus, { icon: string; label: string; className: string
 export function StatusBadge({ status }: { status: JobStatus }) {
   const s = STATUS[status] ?? STATUS.queued;
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-surface-1 px-2 py-0.5 text-xs font-medium text-ink">
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-surface-1 px-2 py-0.5 text-[11px] font-medium text-ink">
       <span className={`${s.className} ${status === "running" ? "animate-pulse" : ""}`} aria-hidden>
         {s.icon}
       </span>
@@ -23,7 +23,7 @@ export function StatusBadge({ status }: { status: JobStatus }) {
 
 export function CheckBadge({ ok, label }: { ok: boolean; label: string }) {
   return (
-    <span className="inline-flex items-center gap-1.5 text-sm text-ink">
+    <span className="inline-flex items-center gap-1.5 text-[13px] text-ink">
       <span className={ok ? "text-good" : "text-critical"} aria-hidden>{ok ? "✓" : "✕"}</span>
       {label}
     </span>

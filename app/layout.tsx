@@ -1,8 +1,14 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
-import Link from "next/link";
-import { Nav } from "@/components/nav";
+import { Suspense } from "react";
+import { Geist, Geist_Mono, Inter } from "next/font/google";
+import { AppMain } from "@/components/app-main";
+import { AppSidebar } from "@/components/app-sidebar";
+import { WarmupOnVisit } from "@/components/warmup";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import "./globals.css";
+import { cn } from "@/lib/utils";
+
+const inter = Inter({subsets:['latin'],variable:'--font-sans'});
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
@@ -14,22 +20,18 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
+    <html lang="en" className={cn("h-full", "antialiased", geistSans.variable, geistMono.variable, "font-sans", inter.variable)}>
       <body className="min-h-full">
-        <div className="flex min-h-screen flex-col md:flex-row">
-          <aside className="border-b border-line bg-surface-1 p-3 md:sticky md:top-0 md:h-screen md:w-56 md:shrink-0 md:border-b-0 md:border-r md:p-4">
-            <Link href="/" className="mb-0 flex items-center gap-2 px-2 pb-3 md:mb-6 md:pb-0">
-              <span className="text-lg font-extrabold tracking-tight text-ink">
-                Jeno<span className="text-brand">size</span>
-              </span>
-              <span className="rounded bg-accent-wash px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-accent-ink">
-                AI Content
-              </span>
-            </Link>
-            <Nav />
-          </aside>
-          <main className="min-w-0 flex-1 px-4 py-6 md:px-8 md:py-8">{children}</main>
+        <TooltipProvider>
+        <WarmupOnVisit />
+        {/* App shell: left sidebar (drawer + slim top bar on mobile), content to the right. */}
+        <div className="min-h-screen bg-surface-0 lg:flex">
+          <Suspense>
+            <AppSidebar />
+          </Suspense>
+          <AppMain>{children}</AppMain>
         </div>
+        </TooltipProvider>
       </body>
     </html>
   );

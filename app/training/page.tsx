@@ -5,6 +5,7 @@ import { useState } from "react";
 import { JobButton } from "@/components/job-button";
 import { StatusBadge } from "@/components/status";
 import { Card, Empty, Field, PageHeader, inputClass } from "@/components/ui";
+import { LoadingState } from "@/components/loading-state";
 import { ago, duration, fixed } from "@/lib/format";
 import { usePoll } from "@/lib/hooks";
 import type { DatasetVersion, JobRun } from "@/lib/types";
@@ -20,8 +21,8 @@ export default function TrainingPage() {
 
   return (
     <>
-      <PageHeader title="Training" subtitle="QLoRA fine-tune of Qwen3-4B on a Modal L4. Progress streams live once the GPU starts." />
-      <div className="grid gap-6 lg:grid-cols-3">
+      <PageHeader title="Training" subtitle="Fine-tuning runs and live progress." />
+      <div className="grid gap-4 lg:grid-cols-3">
         <Card title="New training run">
           <div className="space-y-3">
             <Field label="Dataset version">
@@ -47,26 +48,26 @@ export default function TrainingPage() {
               disabled={!chosen}
               body={{ version: chosen, epochs, lora_r: rank, learning_rate: Number(lr) }}
             />
-            {!datasets.loading && !datasets.data?.length && <p className="text-xs text-critical">Publish a dataset on the Data page first.</p>}
+            {datasets.loading ? <LoadingState label="Loading datasets" /> : !datasets.data?.length && <p className="text-xs text-critical">Publish a dataset on the Data page first.</p>}
           </div>
         </Card>
 
         <Card title="Training runs" className="lg:col-span-2">
           {runs.data?.length ? (
-            <table className="w-full text-left text-sm">
+            <table className="w-full text-left text-xs">
               <thead className="text-xs text-muted">
                 <tr>
-                  <th className="pb-2 font-medium">Dataset</th>
-                  <th className="pb-2 font-medium">Status</th>
-                  <th className="pb-2 font-medium">Final loss</th>
-                  <th className="pb-2 font-medium">Duration</th>
-                  <th className="pb-2 font-medium">Started</th>
+                  <th className="pb-1.5 font-medium">Dataset</th>
+                  <th className="pb-1.5 font-medium">Status</th>
+                  <th className="pb-1.5 font-medium">Final loss</th>
+                  <th className="pb-1.5 font-medium">Duration</th>
+                  <th className="pb-1.5 font-medium">Started</th>
                 </tr>
               </thead>
               <tbody>
                 {runs.data.map((run) => (
                   <tr key={run.id} className="border-t border-line">
-                    <td className="py-2">
+                    <td className="py-1.5">
                       <Link href={`/runs/${run.id}`} className="font-medium hover:text-accent-ink">
                         {String(run.params.version)} · r{String(run.params.lora_r)} · {String(run.params.epochs)}ep
                       </Link>

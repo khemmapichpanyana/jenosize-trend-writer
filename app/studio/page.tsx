@@ -1,74 +1,55 @@
 "use client";
 
-import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { Button, Card, Empty, ErrorNote, PageHeader } from "@/components/ui";
-import { get, post } from "@/lib/api";
-import { ago } from "@/lib/format";
-import { usePoll } from "@/lib/hooks";
-import type { Thread } from "@/lib/types";
+import { ErrorNote } from "@/components/ui";
+import { LoadingState } from "@/components/loading-state";
+import { get } from "@/lib/api";
+import { openOrCreateThread } from "@/lib/thread";
 
 function StudioIndex() {
   const router = useRouter();
   const search = useSearchParams();
-  const threads = usePoll<Thread[]>("/studio/threads", 15_000);
-  const [creating, setCreating] = useState(false);
+  const [status, setStatus] = useState<"starting" | "ready" | "error">("starting");
   const [error, setError] = useState<string | null>(null);
 
-  // /studio?artifact=<id> (from the Published page) opens that artifact's chat.
   useEffect(() => {
-    const artifact = search.get("artifact");
-    if (!artifact) return;
-    get<{ thread_id: string }>(`/studio/artifacts/${artifact}`)
-      .then((a) => router.replace(`/studio/${a.thread_id}?artifact=${artifact}`))
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [search, router]);
+    let cancelled = false;
 
-  async function newChat() {
-    setCreating(true);
-    try {
-      const thread = await post<Thread>("/studio/threads");
-      router.push(`/studio/${thread.id}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setCreating(false);
+    async function openDemoThread() {
+      try {
+        const artifact = search.get("artifact");
+        if (artifact) {
+          const owner = await get<{ thread_id: string }>(`/studio/artifacts/${artifact}`);
+          if (!cancelled) router.replace(`/studio/${owner.thread_id}?artifact=${artifact}`);
+          return;
+        }
+
+        const thread = await openOrCreateThread();
+        if (!cancelled) router.replace(`/studio/${thread.id}`);
+      } catch (e) {
+        if (cancelled) return;
+        setStatus("error");
+        setError(e instanceof Error ? e.message : String(e));
+      }
     }
-  }
+
+    void openDemoThread();
+    return () => {
+      cancelled = true;
+    };
+  }, [router, search]);
 
   return (
-    <>
-      <PageHeader
-        title="Studio"
-        subtitle="Chat with the content agent. It writes with the fine-tuned Jenosize model, designs branded pages, and you publish them."
-        action={<Button variant="primary" onClick={newChat} busy={creating}>New chat</Button>}
-      />
-      <ErrorNote message={error ?? threads.error} />
-      <Card>
-        {threads.data?.length ? (
-          <ul className="divide-y divide-line">
-            {threads.data.map((t) => (
-              <li key={t.id}>
-                <Link href={`/studio/${t.id}`} className="flex items-center justify-between gap-3 py-3 hover:text-accent-ink">
-                  <span className="truncate font-medium">{t.title}</span>
-                  <span className="shrink-0 text-xs text-ink-2">
-                    {t.artifact_count ? `${t.artifact_count} artifact${t.artifact_count > 1 ? "s" : ""} · ` : ""}
-                    {ago(t.updated_at)}
-                  </span>
-                </Link>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <Empty>{threads.loading ? "Loading…" : "No chats yet — start one."}</Empty>
-        )}
-      </Card>
-    </>
+    <div className="mx-auto max-w-3xl px-4 py-6">
+      <ErrorNote message={error} />
+      {status === "starting" && <LoadingState label="Opening your latest conversation" rows={4} />}
+    </div>
   );
 }
 
 export default function StudioPage() {
-  // useSearchParams needs a Suspense boundary for static rendering.
   return (
     <Suspense>
       <StudioIndex />

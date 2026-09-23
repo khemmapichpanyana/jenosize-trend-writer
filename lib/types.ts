@@ -86,6 +86,8 @@ export interface Thread {
   created_at: string;
   updated_at: string;
   artifact_count?: number;
+  message_count?: number;
+  agent_call_count?: number;
 }
 
 export interface ToolCallRecord {
@@ -122,6 +124,51 @@ export interface PublishedPage {
   artifact_id: string;
   updated_at: string;
   url?: string;
+}
+
+export interface PublishedPageResults {
+  total: number;
+  limit: number;
+  offset: number;
+  items: PublishedPage[];
+}
+
+export interface GeneratedArticle {
+  id: string;
+  thread_id: string;
+  title: string;
+  current_version: number;
+  updated_at: string;
+  slug: string | null;
+  status: "draft" | "published";
+}
+
+export interface GeneratedArticlePage {
+  total: number;
+  limit: number;
+  offset: number;
+  items: GeneratedArticle[];
+}
+
+/** Older deployed API versions returned a bare array. Keep the client tolerant during rollout. */
+export type PublishedPageResponse = PublishedPageResults | PublishedPage[];
+
+export interface ArticleSummary {
+  url: string;
+  category_slug: string | null;
+  title: string | null;
+  word_count: number;
+  is_duplicate: boolean;
+  labelled: boolean;
+  error: string | null;
+  last_checked_at: string | null;
+}
+
+export interface ArticlePage {
+  total: number;
+  limit: number;
+  offset: number;
+  items: ArticleSummary[];
 }
 
 export interface Artifact {

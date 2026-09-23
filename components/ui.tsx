@@ -1,27 +1,30 @@
 import type { ReactNode } from "react";
+import { Button as ShadcnButton } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 export function Card({ title, action, children, className = "" }: { title?: ReactNode; action?: ReactNode; children: ReactNode; className?: string }) {
   return (
-    <section className={`rounded-xl border border-line bg-surface-1 ${className}`}>
+    <section className={`rounded-xl border border-line bg-surface-1 shadow-[0_6px_20px_rgba(7,19,38,0.03)] ${className}`}>
       {(title || action) && (
-        <header className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
-          <h2 className="text-sm font-semibold text-ink">{title}</h2>
+        <header className="flex h-10 items-center justify-between gap-3 border-b border-line px-3.5 py-2.5">
+          <h2 className="min-w-0 text-[13px] font-semibold tracking-[-0.01em] text-ink">{title}</h2>
           {action}
         </header>
       )}
-      <div className="p-4">{children}</div>
+      {/* overflow-x-auto: wide tables scroll inside the card on phones instead of widening the page */}
+      <div className="overflow-x-auto p-3.5">{children}</div>
     </section>
   );
 }
 
 export function PageHeader({ title, subtitle, action }: { title: string; subtitle?: string; action?: ReactNode }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{title}</h1>
-        {subtitle && <p className="mt-1 text-sm text-ink-2">{subtitle}</p>}
+    <div className="t-stagger is-shown mb-5 flex flex-wrap items-center justify-between gap-3">
+      <div className="min-w-0">
+        <h1 className="t-stagger-line t-stagger-line--1 text-[18px] font-semibold tracking-[-0.02em] text-ink">{title}</h1>
+        {subtitle && <p className="t-stagger-line t-stagger-line--2 mt-0.5 max-w-xl truncate text-xs text-muted">{subtitle}</p>}
       </div>
-      {action}
+      <div className="t-stagger-line t-stagger-line--2">{action}</div>
     </div>
   );
 }
@@ -30,29 +33,30 @@ type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "
 
 export function Button({ variant = "secondary", busy, children, className = "", disabled, ...rest }: ButtonProps) {
   const styles = {
-    primary: "bg-accent text-white hover:opacity-90",
-    secondary: "border border-line bg-surface-1 text-ink hover:bg-surface-2",
-    danger: "border border-line bg-surface-1 text-critical hover:bg-surface-2",
+    primary: "bg-accent text-white shadow-[0_4px_14px_rgba(36,87,214,0.16)] hover:bg-accent/90",
+    secondary: "border-line bg-surface-1 text-ink hover:border-accent/35 hover:bg-accent-wash",
+    danger: "border-line bg-surface-1 text-critical hover:bg-critical/10",
   }[variant];
   return (
-    <button
-      className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${styles} ${className}`}
+    <ShadcnButton
+      variant={variant === "primary" ? "default" : variant === "danger" ? "destructive" : "outline"}
+      className={cn("h-8 rounded-full px-3.5 text-xs", styles, className)}
       disabled={disabled || busy}
       {...rest}
     >
       {busy && <span className="size-3 animate-spin rounded-full border-2 border-current border-t-transparent" aria-hidden />}
       {children}
-    </button>
+    </ShadcnButton>
   );
 }
 
 /** Stat tile: label (sentence case), value, optional hint. */
 export function StatTile({ label, value, hint }: { label: string; value: ReactNode; hint?: ReactNode }) {
   return (
-    <div className="rounded-xl border border-line bg-surface-1 p-4">
-      <div className="text-xs font-medium text-muted">{label}</div>
-      <div className="mt-1 text-2xl font-semibold tabular-nums text-ink">{value}</div>
-      {hint && <div className="mt-1 text-xs text-ink-2">{hint}</div>}
+    <div className="rounded-xl border border-line bg-surface-1 p-3 shadow-[0_6px_20px_rgba(7,19,38,0.02)]">
+      <div className="text-[11px] font-medium text-ink-2">{label}</div>
+      <div className="mt-0.5 text-lg font-semibold tabular-nums tracking-tight text-ink">{value}</div>
+      {hint && <div className="mt-0.5 text-[11px] text-ink-2">{hint}</div>}
     </div>
   );
 }
@@ -79,14 +83,14 @@ export function Meter({ label, value, max, unit = "", warnAt, dangerAt }: { labe
 }
 
 export function Empty({ children }: { children: ReactNode }) {
-  return <p className="py-6 text-center text-sm text-muted">{children}</p>;
+  return <p className="py-4 text-center text-xs text-muted">{children}</p>;
 }
 
 export function ErrorNote({ message }: { message: string | null | undefined }) {
   if (!message) return null;
   return (
-    <p role="alert" className="rounded-lg border border-line bg-surface-2 px-3 py-2 text-sm text-ink">
-      <span className="mr-1 font-semibold text-critical" aria-hidden>✕</span>
+    <p role="alert" className="rounded-lg border border-critical/30 bg-critical/5 px-3 py-2 text-[13px] leading-5 text-ink">
+      <span className="mr-1 font-semibold text-critical" aria-hidden>×</span>
       {message}
     </p>
   );
@@ -94,13 +98,13 @@ export function ErrorNote({ message }: { message: string | null | undefined }) {
 
 export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
-    <label className="block text-sm">
+    <label className="block text-[13px]">
       <span className="mb-1 block font-medium text-ink-2">{label}</span>
       {children}
-      {hint && <span className="mt-1 block text-xs text-muted">{hint}</span>}
+      {hint && <span className="mt-1 block text-[11px] text-muted">{hint}</span>}
     </label>
   );
 }
 
 export const inputClass =
-  "w-full rounded-lg border border-line bg-surface-1 px-3 py-2 text-sm text-ink placeholder:text-muted focus:border-accent focus:outline-none";
+  "w-full rounded-lg border border-line bg-surface-1 px-2.5 py-2 text-[13px] text-ink placeholder:text-muted transition-[border-color,box-shadow] focus:border-accent focus:outline-none focus:ring-4 focus:ring-accent/10";

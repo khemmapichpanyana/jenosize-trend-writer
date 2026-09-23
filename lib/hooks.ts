@@ -9,18 +9,43 @@ interface PollState<T> {
   error: string | null;
 }
 
+// Last good response per path, shared across mounts: navigating back to a page
+// shows its previous data instantly while the refetch runs (stale-while-revalidate).
+const cache = new Map<string, unknown>();
+// One request per path at a time, however many components poll it.
+const inflight = new Map<string, Promise<unknown>>();
+
+function fetchShared<T>(path: string): Promise<T> {
+  const pending = inflight.get(path);
+  if (pending) return pending as Promise<T>;
+  const request = get<T>(path)
+    .then((data) => {
+      cache.set(path, data);
+      return data;
+    })
+    .finally(() => inflight.delete(path));
+  inflight.set(path, request);
+  return request;
+}
+
+/** Drop cached data for paths starting with `prefix`, e.g. after a write. */
+export function invalidate(prefix: string) {
+  for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key);
+}
+
 /**
- * Fetch a studio path now and every `intervalMs`, pausing while the tab is hidden.
- * State is tagged with the path it belongs to, so switching paths never shows
- * the previous path's data and "loading" is derived rather than set in an effect.
+ * Fetch a studio path now and every `intervalMs`, pausing while the tab is hidden
+ * and refetching as soon as it becomes visible again. State is tagged with the
+ * path it belongs to, so switching paths never shows another path's data.
  */
 export function usePoll<T>(path: string | null, intervalMs = 5000) {
   const [state, setState] = useState<PollState<T>>({ path: null, data: null, error: null });
 
   const refresh = useCallback(async () => {
     if (!path) return;
+    inflight.delete(path);
     try {
-      const data = await get<T>(path);
+      const data = await fetchShared<T>(path);
       setState({ path, data, error: null });
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
@@ -32,7 +57,7 @@ export function usePoll<T>(path: string | null, intervalMs = 5000) {
     if (!path) return;
     let cancelled = false;
     const tick = () =>
-      get<T>(path)
+      fetchShared<T>(path)
         .then((data) => !cancelled && setState({ path, data, error: null }))
         .catch((e) => {
           if (cancelled) return;
@@ -45,17 +70,24 @@ export function usePoll<T>(path: string | null, intervalMs = 5000) {
           if (document.visibilityState === "visible") void tick();
         }, intervalMs)
       : undefined;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [path, intervalMs]);
 
   const current = state.path === path;
+  // Not fetched on this mount yet, but seen before: show the cached copy.
+  const cached = !current && path !== null && cache.has(path);
   return {
-    data: current ? state.data : null,
+    data: current ? state.data : cached ? (cache.get(path) as T) : null,
     error: current ? state.error : null,
-    loading: path !== null && !current,
+    loading: path !== null && !current && !cached,
     refresh,
   };
 }

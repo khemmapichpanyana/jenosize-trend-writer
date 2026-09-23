@@ -32,31 +32,31 @@ export default function ModelsPage() {
 
   return (
     <>
-      <PageHeader title="Models" subtitle="Trained adapters on the Modal volume. Every version is served by name; `jeno-lora` points at the active one." />
-      <div className="grid gap-6 xl:grid-cols-3">
+      <PageHeader title="Models" subtitle="Trained LoRA adapters and which one is live." />
+      <div className="grid gap-4 xl:grid-cols-3">
         <Card title="Adapters" className="xl:col-span-2">
           {adapters.data?.length ? (
-            <table className="w-full text-left text-sm">
+            <table className="w-full text-left text-xs">
               <thead className="text-xs text-muted">
                 <tr>
-                  <th className="pb-2 font-medium">Version</th>
-                  <th className="pb-2 font-medium">Served as</th>
-                  <th className="pb-2 font-medium">Train loss</th>
-                  <th className="pb-2 font-medium">Steps</th>
-                  <th className="pb-2" />
+                  <th className="pb-1.5 font-medium">Version</th>
+                  <th className="pb-1.5 font-medium">Served as</th>
+                  <th className="pb-1.5 font-medium">Train loss</th>
+                  <th className="pb-1.5 font-medium">Steps</th>
+                  <th className="pb-1.5" />
                 </tr>
               </thead>
               <tbody>
                 {adapters.data.map((a) => (
                   <tr key={a.version} className="border-t border-line">
-                    <td className="py-2 font-semibold">
+                    <td className="py-1.5 font-semibold">
                       {a.version}
                       {a.active && <span className="ml-2 rounded bg-accent-wash px-1.5 py-0.5 text-xs font-medium text-accent-ink">active</span>}
                     </td>
                     <td className="font-mono text-xs">{a.served_as}</td>
                     <td className="tabular-nums">{fixed(a.metrics.train_loss)}</td>
                     <td className="tabular-nums">{a.metrics.steps ?? "—"}</td>
-                    <td className="py-2 text-right">
+                    <td className="py-1.5 text-right">
                       <div className="flex justify-end gap-2">
                         {!a.active && <Button onClick={() => activate(a.version)} busy={activating === a.version}>Make active</Button>}
                         <JobButton
@@ -79,8 +79,12 @@ export default function ModelsPage() {
                 ))}
               </tbody>
             </table>
+          ) : adapters.error ? (
+            <Empty>Adapter registry is unavailable: {adapters.error}</Empty>
+          ) : adapters.loading ? (
+            <Empty>Loading adapter registry…</Empty>
           ) : (
-            <Empty>No trained adapters yet — start a run on the Training page.</Empty>
+            <Empty>No adapters are visible in this backend&apos;s model volume. A local API cannot read the deployed Modal volume; use the deployed Jobs API to inspect or activate the served LoRA.</Empty>
           )}
           <p className="mt-3 text-xs text-muted">Activation takes effect the next time the vLLM server starts (it scales to zero after 5 idle minutes).</p>
         </Card>
@@ -90,7 +94,7 @@ export default function ModelsPage() {
             <Field label="vLLM endpoint" hint="The server URL printed by `make deploy-modal`, ending in /v1. Saved in this browser.">
               <input className={inputClass} value={endpoint} onChange={(e) => saveEndpoint(e.target.value)} placeholder="https://…-vllmserver.modal.run/v1" />
             </Field>
-            <label className="flex items-center gap-2 text-sm text-ink-2">
+            <label className="flex items-center gap-2 text-[13px] text-ink-2">
               <input type="checkbox" checked={judge} onChange={(e) => setJudge(e.target.checked)} />
               Blind judge (the labelling LLM compares base vs fine-tuned)
             </label>
@@ -101,13 +105,13 @@ export default function ModelsPage() {
         </Card>
       </div>
 
-      <Card title="Evaluations" className="mt-6">
+      <Card title="Evaluations" className="mt-4">
         {evals.data?.length ? (
           <ul className="divide-y divide-line">
             {evals.data.map((run) => {
               const summary = (run.result?.summary ?? {}) as { deterministic?: Record<string, Record<string, number>>; judge?: Record<string, number> | null };
               return (
-                <li key={run.id} className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm">
+                <li key={run.id} className="flex flex-wrap items-center justify-between gap-3 py-2 text-[13px]">
                   <Link href={`/runs/${run.id}`} className="font-medium hover:text-accent-ink">{String(run.params.version)} · {ago(run.created_at)}</Link>
                   <StatusBadge status={run.status} />
                   {summary.deterministic && (

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { LineChart } from "@/components/line-chart";
 import { StatusBadge } from "@/components/status";
 import { Button, Card, Empty, ErrorNote, Meter, StatTile } from "@/components/ui";
+import { LoadingState } from "@/components/loading-state";
 import { API, get, post } from "@/lib/api";
 import { duration, fixed } from "@/lib/format";
 import { streamSse } from "@/lib/sse";
@@ -93,14 +94,14 @@ export function RunLive({ id }: { id: string }) {
     }
   }
 
-  if (!run) return <Empty>{connection === "connecting" ? "Connecting…" : "Loading run…"}</Empty>;
+  if (!run) return <LoadingState label={connection === "connecting" ? "Connecting to run" : "Loading run"} />;
   const isTrain = run.kind === "train";
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold tracking-tight">
+          <h1 className="text-[20px] font-semibold tracking-tight">
             {run.kind} {run.params.version ? String(run.params.version) : ""}
           </h1>
           <StatusBadge status={run.status} />
@@ -114,7 +115,7 @@ export function RunLive({ id }: { id: string }) {
 
       {isTrain && (
         <>
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-4">
             <StatTile label="Step" value={total ? `${step} / ${total}` : step || "—"} hint={latest?.phase} />
             <StatTile label="Latest loss" value={fixed(training.at(-1)?.loss)} hint={lossPoints.length > 1 ? `started at ${fixed(lossPoints[0].y)}` : undefined} />
             <StatTile label="Elapsed" value={duration(run.started_at, TERMINAL.has(run.status) ? run.finished_at : null)} />
@@ -124,7 +125,7 @@ export function RunLive({ id }: { id: string }) {
             <div className="h-full rounded-full bg-accent transition-[width] duration-500" style={{ width: `${pct}%` }} />
           </div>
 
-          <div className="grid gap-6 xl:grid-cols-3">
+          <div className="grid gap-4 xl:grid-cols-3">
             <Card title="Training loss" className="xl:col-span-2">
               <LineChart points={lossPoints} xLabel="step" yLabel="loss" emptyText={latest?.message ?? "Waiting for the first logged step…"} />
             </Card>
@@ -149,13 +150,13 @@ export function RunLive({ id }: { id: string }) {
 
       {run.stages && run.stages.length > 0 && (
         <Card title="Stages">
-          <table className="w-full text-left text-sm">
+          <table className="w-full text-left text-xs">
             <tbody>
               {run.stages.map((s) => (
                 <tr key={s.stage + s.started_at} className="border-t border-line first:border-t-0">
-                  <td className="py-2 font-medium">{s.stage}</td>
-                  <td className="py-2 text-ink-2">{s.status}</td>
-                  <td className="py-2 font-mono text-xs text-ink-2">
+                  <td className="py-1.5 font-medium">{s.stage}</td>
+                  <td className="py-1.5 text-ink-2">{s.status}</td>
+                  <td className="py-1.5 font-mono text-xs text-ink-2">
                     {Object.entries(s.stats).filter(([k]) => k !== "seconds").map(([k, v]) => `${k}=${v}`).join("  ")}
                   </td>
                 </tr>
@@ -165,7 +166,7 @@ export function RunLive({ id }: { id: string }) {
         </Card>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-2">
         <Card title="Parameters"><pre className="overflow-auto text-xs text-ink-2">{JSON.stringify(run.params, null, 2)}</pre></Card>
         <Card title="Result">
           {run.result ? <pre className="overflow-auto text-xs text-ink-2">{JSON.stringify(run.result, null, 2)}</pre> : <Empty>{TERMINAL.has(run.status) ? "No result." : "Running…"}</Empty>}

@@ -24,7 +24,17 @@ async function forward(request: NextRequest, ctx: RouteContext<"/api/studio/[...
   if (path[0] !== "v1") {
     return Response.json({ error: { code: "not_found", message: "Unknown route" } }, { status: 404 });
   }
-  const { url, key } = studioConfig();
+  let url: string;
+  let key: string;
+  try {
+    ({ url, key } = studioConfig());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Studio API is not configured";
+    return Response.json(
+      { error: { code: "not_configured", message } },
+      { status: 503, headers: { "Cache-Control": "no-store" } },
+    );
+  }
   const target = `${url}/${path.map(encodeURIComponent).join("/")}${request.nextUrl.search}`;
 
   const headers = new Headers({ "X-API-Key": key });
@@ -58,8 +68,17 @@ async function forward(request: NextRequest, ctx: RouteContext<"/api/studio/[...
   if (out.get("content-type")?.includes("text/event-stream")) {
     out.set("Cache-Control", "no-cache, no-transform");
     out.set("X-Accel-Buffering", "no");
+    return new Response(upstream.body, { status: upstream.status, headers: out });
   }
-  return new Response(upstream.body, { status: upstream.status, headers: out });
+
+  // Modal may answer ordinary JSON with chunked transfer encoding. Returning
+  // that stream directly can leave browser fetch waiting for the body while
+  // curl already shows the complete payload. Buffer non-SSE responses so the
+  // client receives one complete, correctly sized JSON response; only live
+  // event streams stay streaming.
+  const body = await upstream.arrayBuffer();
+  out.set("content-length", String(body.byteLength));
+  return new Response(body, { status: upstream.status, headers: out });
 }
 
 export { forward as DELETE, forward as GET, forward as PATCH, forward as POST, forward as PUT };

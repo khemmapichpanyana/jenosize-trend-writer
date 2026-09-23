@@ -95,6 +95,9 @@ export interface ToolCallRecord {
   name: string;
   args?: Record<string, unknown>;
   result?: string;
+  notes?: string[];
+  started_at?: string;
+  duration_ms?: number;
 }
 
 export interface ChatMessage {

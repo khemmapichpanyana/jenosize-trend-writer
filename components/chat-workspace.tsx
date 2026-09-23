@@ -2,7 +2,7 @@
 
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Check, ChevronDown, CircleAlert, Copy, Eye, FileCode2, LoaderCircle, PanelRight, PenLine, Plus, RotateCcw, Square, X } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, Copy, Eye, FileCode2, LoaderCircle, PanelRight, PenLine, Plus, RotateCcw, Square, X } from "lucide-react";
 import {
   Message as AiMessage,
   MessageContent as AiMessageContent,
@@ -10,8 +10,8 @@ import {
 } from "@/components/ai-elements/message";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import { PromptInput, PromptInputBody, PromptInputTextarea } from "@/components/ai-elements/prompt-input";
-import { Task, TaskContent, TaskItem, TaskTrigger } from "@/components/ai-elements/task";
 import { openPalette } from "@/components/app-sidebar";
+import { AgentSteps, parseResult, stepsFromRecords, type AgentStep } from "@/components/agent-steps";
 import { ModelBadge } from "@/components/model-badge";
 import { ModelStatusControl } from "@/components/model-status";
 import { Button, ErrorNote } from "@/components/ui";
@@ -21,7 +21,7 @@ import { invalidate } from "@/lib/hooks";
 import { markModelReady, useModelStatus, wakeModel } from "@/lib/model-status";
 import { takePendingBrief } from "@/lib/pending-brief";
 import { streamSse } from "@/lib/sse";
-import type { AgentRun, Artifact, Asset, ChatMessage, PublishedPage, ThreadDetail, ToolCallRecord } from "@/lib/types";
+import type { AgentRun, Artifact, Asset, ChatMessage, PublishedPage, ThreadDetail } from "@/lib/types";
 
 const ASSET_BASE = `${API}/studio/assets`;
 // Streamdown renders plain markdown elements at browser/library default sizes;
@@ -29,28 +29,14 @@ const ASSET_BASE = `${API}/studio/assets`;
 // rest of the console uses, regardless of what Streamdown sets internally.
 const COMPACT_PROSE =
   "[&_p]:my-1.5 [&_p]:text-[13px] [&_p]:leading-5 [&_li]:text-[13px] [&_li]:leading-5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_h1]:mb-1 [&_h1]:mt-2 [&_h1]:text-[15px] [&_h1]:font-semibold [&_h2]:mb-1 [&_h2]:mt-2 [&_h2]:text-[14px] [&_h2]:font-semibold [&_h3]:mb-1 [&_h3]:mt-1.5 [&_h3]:text-[13px] [&_h3]:font-semibold [&_pre]:text-[12px] [&_code]:text-[12px]";
-const TOOL_LABEL: Record<string, string> = {
-  web_search: "Researching the web",
-  write_article: "Writing with the fine-tuned model",
-  design_page: "Designing the branded page",
-  list_images: "Checking your images",
-  get_artifact: "Reading the artifact",
-  generate_image: "Generating an editorial image",
-};
 
-interface LiveTool {
-  id: string;
-  name: string;
-  state: "running" | "done" | "error";
-  note?: string;
-}
 
 interface LiveTurn {
   runId: string | null;
   user: string;
   assetIds: string[];
   reply: string;
-  tools: LiveTool[];
+  tools: AgentStep[];
 }
 
 /** Keep the chat renderable while older API deployments are rolling forward. */
@@ -113,22 +99,52 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
         setLive((t) => (t ? { ...t, reply: t.reply + String(data.text ?? "") } : t));
         break;
       case "tool_start":
-        setLive((t) => (t ? { ...t, tools: [...t.tools, { id: String(data.id), name: String(data.name), state: "running" }] } : t));
+        setLive((t) =>
+          t && !t.tools.some((x) => x.id === String(data.id))
+            ? {
+                ...t,
+                tools: [
+                  ...t.tools,
+                  {
+                    id: String(data.id),
+                    name: String(data.name),
+                    state: "running",
+                    args: (data.args as Record<string, unknown>) ?? {},
+                    notes: [],
+                    startedAt: typeof data.started_at === "string" ? Date.parse(data.started_at) : Date.now(),
+                  },
+                ],
+              }
+            : t,
+        );
         break;
       case "tool_progress":
         setLive((t) =>
-          t ? { ...t, tools: t.tools.map((x) => (x.name === data.tool && x.state === "running" ? { ...x, note: String(data.message ?? "") } : x)) } : t,
+          t
+            ? {
+                ...t,
+                // Notes go to the latest running call of that tool (parallel searches share a name).
+                tools: (() => {
+                  const message = String(data.message ?? "");
+                  const target = t.tools.findLast((x) => x.name === data.tool && x.state === "running");
+                  if (!target || !message || target.notes.at(-1) === message) return t.tools;
+                  return t.tools.map((x) => (x === target ? { ...x, notes: [...x.notes, message] } : x));
+                })(),
+              }
+            : t,
         );
         break;
       case "tool_end": {
-        const result = data.result as Record<string, unknown> | string;
-        const failed = typeof result === "object" && result && "error" in result;
+        const result = parseResult(data.result);
+        const failed = Boolean(result && "error" in result);
         setLive((t) =>
           t
             ? {
                 ...t,
                 tools: t.tools.map((x) =>
-                  x.id === String(data.id) ? { ...x, state: failed ? "error" : "done", note: failed ? String((result as Record<string, unknown>).error) : x.note } : x,
+                  x.id === String(data.id)
+                    ? { ...x, state: failed ? "error" : "done", result, durationMs: typeof data.duration_ms === "number" ? data.duration_ms : x.startedAt ? Date.now() - x.startedAt : undefined }
+                    : x,
                 ),
               }
             : t,
@@ -331,6 +347,11 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
     return <div className="mx-auto max-w-3xl px-4 py-6">{error ? <ErrorNote message={error} /> : <LoadingState label="Loading conversation" />}</div>;
   }
 
+  // While a turn is live, its user message is already saved server-side, so a
+  // mid-run reload (e.g. on the "artifact" event) brings it back in
+  // thread.messages. The live block renders it, so drop the saved copy — the
+  // trailing user message(s) after the last assistant reply.
+  const shown = live ? dropTrailingUser(thread.messages) : thread.messages;
   const lastAssistantId = [...thread.messages].reverse().find((m) => m.role === "assistant")?.id ?? null;
   const lastUserText = [...thread.messages].reverse().find((m) => m.role === "user")?.content ?? null;
 
@@ -377,7 +398,7 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
         <Conversation className="min-h-0 flex-1">
           <ConversationContent className="mx-auto w-full max-w-3xl space-y-5 px-4 pb-6 pt-2 sm:px-6">
           {thread.messages.length === 0 && !live && <Starter onPick={setInput} />}
-          {thread.messages.map((m) => (
+          {shown.map((m) => (
             <MessageBubble
               key={m.id}
               message={m}
@@ -388,7 +409,7 @@ export function ChatWorkspace({ threadId }: { threadId: string }) {
             <>
               <MessageBubble message={{ id: "live-user", role: "user", content: live.user, created_at: "", tool_calls: [], asset_ids: live.assetIds, model: null }} />
               <AiMessage from="assistant">
-                <ToolTrace tools={live.tools} />
+                <AgentSteps steps={live.tools} />
                 <AiMessageContent className={`w-full px-0.5 py-0 text-[13.5px] text-ink ${COMPACT_PROSE}`}>
                   {live.reply ? <MessageResponse>{live.reply}</MessageResponse> : (
                     <span className="t-shimmer inline-flex items-center gap-2 font-medium">
@@ -563,6 +584,12 @@ function Starter({ onPick }: { onPick: (text: string) => void }) {
   );
 }
 
+function dropTrailingUser(messages: ChatMessage[]): ChatMessage[] {
+  let end = messages.length;
+  while (end > 0 && messages[end - 1].role === "user") end -= 1;
+  return end === messages.length ? messages : messages.slice(0, end);
+}
+
 function MessageBubble({ message, onRetry }: { message: ChatMessage; onRetry?: () => void }) {
   const assetIds = Array.isArray(message.asset_ids) ? message.asset_ids : [];
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
@@ -583,7 +610,7 @@ function MessageBubble({ message, onRetry }: { message: ChatMessage; onRetry?: (
   }
   return (
     <AiMessage from="assistant">
-      <ToolTrace tools={toolCalls.map((call: ToolCallRecord, i) => ({ id: call.id ?? String(i), name: call.name, state: toolFailed(call) ? "error" : "done" }))} />
+      <AgentSteps steps={stepsFromRecords(toolCalls)} />
       <AiMessageContent className={`w-full px-0.5 py-0 text-[13.5px] text-ink ${COMPACT_PROSE}`}><MessageResponse>{message.content}</MessageResponse></AiMessageContent>
       <MessageActions text={message.content} model={message.model} onRetry={onRetry} />
     </AiMessage>
@@ -618,42 +645,8 @@ function MessageActions({ text, model, onRetry }: { text: string; model: string 
   );
 }
 
-function ToolTrace({ tools }: { tools: LiveTool[] }) {
-  const running = tools.some((tool) => tool.state === "running");
-  const [manuallyOpen, setManuallyOpen] = useState(false);
-  const open = running || manuallyOpen;
 
-  if (!tools.length) return null;
 
-  return (
-    <Task open={open} onOpenChange={setManuallyOpen} className="not-prose max-w-[90%] rounded-lg border border-line/70 bg-surface-1/70 px-2.5 py-1.5">
-      <TaskTrigger title={`${tools.length} agent step${tools.length === 1 ? "" : "s"}`} />
-      <TaskContent>
-        {tools.map((tool) => <TaskItem key={tool.id} className="t-reveal"><ToolChip name={tool.name} state={tool.state} note={tool.note} /></TaskItem>)}
-      </TaskContent>
-    </Task>
-  );
-}
-
-function toolFailed(call: ToolCallRecord): boolean {
-  try {
-    return Boolean(call.result && "error" in JSON.parse(call.result));
-  } catch {
-    return false;
-  }
-}
-
-function ToolChip({ name, state, note }: { name: string; state: LiveTool["state"]; note?: string }) {
-  const icon = state === "running" ? <LoaderCircle size={11} className="animate-spin" /> : state === "done" ? <Check size={11} /> : <CircleAlert size={11} />;
-  const tone = state === "running" ? "text-accent-ink" : state === "done" ? "text-good" : "text-critical";
-  return (
-    <div className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-line/80 bg-surface-1 px-2.5 py-1 text-[10.5px] text-ink-2 shadow-[0_3px_12px_rgba(7,19,38,0.04)]">
-      <span className={tone} aria-hidden>{icon}</span>
-      <span className="font-medium text-ink">{TOOL_LABEL[name] ?? name}</span>
-      {note && <span className="truncate text-muted">· {note}</span>}
-    </div>
-  );
-}
 
 function ArtifactPanel({
   artifacts,

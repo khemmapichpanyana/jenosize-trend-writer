@@ -84,5 +84,5 @@ fine-tuning set. Generated claims still require editorial fact-checking, and
 the prototype is browser-scoped rather than production multi-tenant. Next
 steps are human review of more held-out topics (especially Thai), a complete
 13-pair style adjudication, evidence/citation checks, and a persistent warm
-serving tier only if usage justifies its cost. The public demo has no login; it
-needs authentication and rate limits before wider use.
+serving tier only if usage justifies its cost. The demo sits behind one shared
+login; per-user accounts and rate limits are the next step before wider use.

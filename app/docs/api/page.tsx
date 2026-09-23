@@ -79,8 +79,8 @@ curl -sS -X POST $JOBS_BASE_URL/v1/studio/warmup -H "X-API-Key: $JOBS_API_KEY"`}
       <Callout tone="note" title="Auth model">
         The product has no end-user accounts yet (it&rsquo;s a single-tenant console, not a multi-tenant product):
         Postgres row-level security denies everything except the server-side key, and an optional
-        <code> X-API-Key</code> guards the write routes. The console itself has no login yet, so put it behind an
-        auth layer before deploying it publicly.
+        <code> X-API-Key</code> guards the write routes. The console itself is behind one shared login
+        (<code>CONSOLE_USER</code> / <code>CONSOLE_PASSWORD</code>); published <code>/p/</code> pages stay public.
       </Callout>
 
       <h2>Scaling &amp; optimisation notes</h2>

@@ -107,7 +107,7 @@ the same writer model and prompt contract as the agent's write_article tool.`}</
         <li><strong>Scale-to-zero GPU.</strong> Cold starts run 1–3 minutes, so there is an explicit warmup
           endpoint and an SSE heartbeat so proxies don&rsquo;t drop the connection while it starts.</li>
         <li><strong>No end-user auth.</strong> There are no product accounts yet: row-level security denies
-          everything except the server-side key, and the console has no login of its own yet — put it behind one before deploying it publicly.</li>
+          everything except the server-side key, and the console sits behind one shared login (HTTP Basic auth in <code>proxy.ts</code>); published <code>/p/</code> pages stay public.</li>
       </ul>
     </Prose>
     <DocsPager current="/docs/how-it-works" />

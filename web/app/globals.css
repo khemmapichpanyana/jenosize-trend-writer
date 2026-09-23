@@ -1,0 +1,246 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+/*
+  ---break---
+*/
+@custom-variant dark (&:is(.dark *));
+
+/* Jenosize editorial console tokens: a bright canvas, deep navy ink, and the
+   electric blue/cyan accents used by the public brand. Keep this intentionally
+   light so the console does not change appearance with the OS theme. */
+:root {
+  --surface-0: #f8faff;
+  --surface-1: #ffffff;
+  --surface-2: #eef4fb;
+  --line: #dbe5f1;
+  --grid: #e4edf7;
+  --text-primary: #071326;
+  --text-secondary: #33445d;
+  --text-muted: #53647c;
+  --brand: #00bdd1;
+  --accent: #2457d6;
+  --accent-ink: #1d4ed8;
+  --accent-wash: rgba(36, 87, 214, 0.09);
+  --series-1: #2457d6;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --background: var(--surface-0);
+  --foreground: var(--text-primary);
+  --card: var(--surface-1);
+  --card-foreground: var(--text-primary);
+  --popover: var(--surface-1);
+  --popover-foreground: var(--text-primary);
+  --primary: #2457d6;
+  --primary-foreground: #ffffff;
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--text-primary);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--text-muted);
+  --accent-foreground: #ffffff;
+  --destructive: #d03b3b;
+  --border: var(--line);
+  --input: var(--line);
+  --ring: #2457d6;
+  --chart-1: oklch(0.809 0.105 251.813);
+  --chart-2: oklch(0.623 0.214 259.815);
+  --chart-3: oklch(0.546 0.245 262.881);
+  --chart-4: oklch(0.488 0.243 264.376);
+  --chart-5: oklch(0.424 0.199 265.638);
+  --radius: 0.625rem;
+  --sidebar: var(--surface-1);
+  --sidebar-foreground: var(--text-primary);
+  --sidebar-primary: #2457d6;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: var(--surface-2);
+  --sidebar-accent-foreground: var(--text-primary);
+  --sidebar-border: var(--line);
+  --sidebar-ring: #2457d6;
+}
+
+@theme inline {
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-ink: var(--text-primary);
+  --color-ink-2: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-brand: var(--brand);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-wash: var(--accent-wash);
+  --color-good: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+html, body { height: 100%; }
+body {
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  text-rendering: optimizeLegibility;
+}
+/* In @layer base so component utilities (e.g. a composer's outline-none, which
+   shows focus on its whole box instead) can override it — unlayered CSS would
+   beat every Tailwind utility. Keyboard focus on buttons/links keeps this ring. */
+@layer base {
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+}
+
+/* Layered like the focus rule: unlayered, `font: inherit` beat every text-size
+   utility on buttons/inputs (e.g. text-[11px] on a button rendered at 16px). */
+@layer base {
+  button, input, textarea, select { font: inherit; }
+}
+
+.brand-grid {
+  background-image: linear-gradient(180deg, rgba(236, 245, 255, 0.48), transparent 24rem);
+}
+
+.editorial-rule {
+  background: linear-gradient(90deg, var(--brand), var(--accent));
+}
+
+/* transitions.dev motion tokens + the two surfaces used by this console:
+   staggered empty-state copy and a quiet thinking shimmer. */
+:root {
+  --duration-stagger: 40ms;
+  --duration-fast: 250ms;
+  --duration-very-slow: 500ms;
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: ease-in-out;
+  --ease-linear: linear;
+  --distance-medium: 12px;
+  --blur-medium: 3px;
+  --stagger-dur: var(--duration-very-slow);
+  --stagger-distance: var(--distance-medium);
+  --stagger-stagger: var(--duration-stagger);
+  --stagger-blur: var(--blur-medium);
+  --stagger-ease: var(--ease-smooth-out);
+  --shimmer-dur: 2000ms;
+  --shimmer-base: var(--text-secondary);
+  --shimmer-highlight: color-mix(in srgb, var(--accent) 70%, white);
+  --shimmer-band: 400%;
+  --shimmer-ease: var(--ease-linear);
+}
+
+/* Texts reveal: the headline lands first, then the supporting copy. */
+.t-stagger-line {
+  display: block;
+  opacity: 0;
+  transform: translateY(var(--stagger-distance));
+  filter: blur(var(--stagger-blur));
+  transition:
+    opacity var(--stagger-dur) var(--stagger-ease),
+    transform var(--stagger-dur) var(--stagger-ease),
+    filter var(--stagger-dur) var(--stagger-ease);
+  will-change: transform, opacity, filter;
+}
+.t-stagger-line--2 { transition-delay: var(--stagger-stagger); }
+.t-stagger.is-shown .t-stagger-line { opacity: 1; transform: translateY(0); filter: blur(0); }
+
+/* Shimmer text: used only while the agent is waiting on a cold model. */
+.t-shimmer {
+  color: var(--shimmer-base);
+  background-image: linear-gradient(90deg, transparent 0%, transparent 40%, var(--shimmer-highlight) 50%, transparent 60%, transparent 100%);
+  background-size: var(--shimmer-band) 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: t-shimmer var(--shimmer-dur) var(--shimmer-ease) infinite;
+}
+@keyframes t-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0% 0; }
+}
+
+/* Shimmer block: a skeleton placeholder bar, for "the agent is working" states
+   where showing raw streaming content would feel noisy (e.g. the artifact
+   panel while write_article is running). Same sweep timing as .t-shimmer. */
+.t-skeleton {
+  background-color: var(--surface-2);
+  background-image: linear-gradient(90deg, transparent 0%, transparent 35%, color-mix(in srgb, var(--accent) 16%, transparent) 50%, transparent 65%, transparent 100%);
+  background-size: var(--shimmer-band) 100%;
+  animation: t-shimmer var(--shimmer-dur) var(--shimmer-ease) infinite;
+}
+
+/* One-shot reveal: the finished artifact swapping in after the skeleton.
+   Unlike .t-stagger (which needs a class toggle after mount to animate),
+   `animation` plays automatically on insert — pair with a React `key` on the
+   element so it remounts (and re-plays) each time the shown artifact/version
+   changes. */
+.t-reveal {
+  animation: t-reveal var(--duration-very-slow) var(--ease-smooth-out) both;
+}
+@keyframes t-reveal {
+  from { opacity: 0; transform: translateY(var(--distance-medium)) scale(0.99); filter: blur(var(--blur-medium)); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-stagger-line { transition: none !important; }
+  .t-shimmer { animation: none !important; -webkit-text-fill-color: currentColor; }
+  .t-skeleton { animation: none !important; }
+  .t-reveal { animation: none !important; }
+}
+/*
+  ---break---
+*/
+/*
+  ---break---
+*/
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}

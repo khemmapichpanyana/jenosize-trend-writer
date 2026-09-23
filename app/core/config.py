@@ -125,7 +125,8 @@ class Settings(BaseSettings):
         default=None, validation_alias=AliasChoices("IMAGE_API_KEY", "OPENAI_API_KEY")
     )
     image_base_url: str = "https://api.openai.com/v1"
-    image_model: str = "gpt-image-2"
+    # GPT Image 2.5 "flare": the fast, high-quality everyday variant.
+    image_model: str = "gpt-image-2.5-flare"
     image_size: str = "1536x1024"
     image_quality: str = "medium"
     image_timeout_s: float = Field(default=180.0, ge=10.0, le=600.0)
@@ -193,6 +194,22 @@ class Settings(BaseSettings):
             f"postgresql://{quote(user, safe='')}:{quote(self.db_password, safe='')}"
             f"@{host}:{self.db_port}/{self.db_name}?sslmode=require"
         )
+        return self
+
+    @model_validator(mode="after")
+    def _image_key_from_labeler(self) -> Settings:
+        """Reuse the labeler's key for images when that key is an OpenAI one.
+
+        One OpenAI account usually serves both; this avoids storing the same
+        secret twice. An explicit IMAGE_API_KEY / OPENAI_API_KEY always wins.
+        """
+        if (
+            not self.image_api_key
+            and self.labeler_api_key
+            and "api.openai.com" in (self.labeler_base_url or "")
+            and "api.openai.com" in self.image_base_url
+        ):
+            self.image_api_key = self.labeler_api_key
         return self
 
     @property

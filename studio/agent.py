@@ -4,12 +4,12 @@ Event stream (what the console renders):
 
     thread       {id, title}                      first event of every turn
     token        {text}                           the agent's reply, token by token
-    tool_start   {id, name, args}                 a tool call began
+    tool_start   {id, name, args, started_at}     a tool call began
     tool_progress{tool, message}                  a tool's own progress note
     artifact_start / artifact_delta {artifact_id, text} / artifact
                                                   an article streaming in from the
                                                   fine-tuned writer, then saved
-    tool_end     {id, name, result}               a tool call finished
+    tool_end     {id, name, result, duration_ms}  a tool call finished
     message      {id, role, content, model}       the saved assistant message
     error        {message}
     done         {}
@@ -18,7 +18,9 @@ Event stream (what the console renders):
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -59,8 +61,10 @@ How you work:
   yourself. Pass an `artifact_id` to revise an existing artifact.
 - To turn an article into a branded web page, call `design_page`. Call
   `list_images` first when the user mentions images, and pass their ids.
-- When the user asks for a visual and no suitable upload exists, call
-  `generate_image`, then pass its returned asset id to `design_page`.
+- `write_article` also creates the article's hero image (GPT Image) and puts
+  it at the top of the article, and `design_page` keeps it automatically. Call
+  `generate_image` only when the user asks for an additional or different
+  image, then pass its asset id to `design_page`.
 - Ask one short clarifying question only when the topic is genuinely unclear;
   otherwise pick sensible defaults (medium length, business-leader audience).
 - After a tool finishes, reply in 1-3 sentences: what you made and what the
@@ -161,6 +165,7 @@ async def run_turn(
 
     reply_parts: list[str] = []
     calls: dict[str, dict[str, Any]] = {}
+    clocks: dict[str, float] = {}  # call id -> monotonic start, for durations
     model_used: str | None = None
     final_text = ""
     try:
@@ -182,6 +187,18 @@ async def run_turn(
                         reply_parts.append(text)
                         yield {"type": "token", "text": text}
             elif mode == "custom":
+                if isinstance(chunk, dict) and chunk.get("type") == "tool_progress":
+                    # Keep the notes with the (latest) running call of that tool,
+                    # so a saved turn shows the same step details as a live one.
+                    running = [
+                        c
+                        for c in calls.values()
+                        if c.get("name") == chunk.get("tool") and "result" not in c
+                    ]
+                    if running and chunk.get("message"):
+                        notes = running[-1].setdefault("notes", [])
+                        if not notes or notes[-1] != chunk["message"]:
+                            notes.append(str(chunk["message"]))
                 yield chunk
             elif mode == "updates":
                 for _node, update in chunk.items():
@@ -197,22 +214,34 @@ async def run_turn(
                                 final_text = msg.content
                             for call in msg.tool_calls:
                                 call_id = call["id"] or f"call-{len(calls)}"
-                                calls[call_id] = {"name": call["name"], "args": call["args"]}
+                                started = datetime.now(UTC)
+                                calls[call_id] = {
+                                    "name": call["name"],
+                                    "args": call["args"],
+                                    "started_at": started.isoformat(),
+                                }
+                                clocks[call_id] = time.monotonic()
                                 yield {
                                     "type": "tool_start",
                                     "id": call_id,
                                     "name": call["name"],
                                     "args": call["args"],
+                                    "started_at": started.isoformat(),
                                 }
                         elif isinstance(msg, ToolMessage):
                             result = str(msg.content)
                             entry = calls.setdefault(msg.tool_call_id, {"name": msg.name})
                             entry["result"] = result
+                            if msg.tool_call_id in clocks:
+                                entry["duration_ms"] = round(
+                                    (time.monotonic() - clocks.pop(msg.tool_call_id)) * 1000
+                                )
                             yield {
                                 "type": "tool_end",
                                 "id": msg.tool_call_id,
                                 "name": entry.get("name"),
                                 "result": _parse(result),
+                                "duration_ms": entry.get("duration_ms"),
                             }
     except Exception as exc:
         logger.exception("agent_turn_failed", extra={"thread_id": str(thread_id)})

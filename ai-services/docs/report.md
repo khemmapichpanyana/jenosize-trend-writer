@@ -2,7 +2,7 @@
 
 **Option 1: Trend & Future Ideas Articles · 23 September 2026**
 
-**Web app:** WEB_URL · **API docs:** https://khemmapich--jenosize-trend-writer-article-api.modal.run/docs · **Code:** REPO_URL
+**Web app:** https://jenosize-trend-writer.vercel.app · **API docs:** https://khemmapich--jenosize-trend-writer-article-api.modal.run/docs · **Code:** https://github.com/khemmapichpanyana/jenosize-trend-writer
 
 ## Approach
 
@@ -11,7 +11,8 @@ keywords, target length, and optional URL or document. A FastAPI service
 normalizes the brief, retrieves relevant passages from any supplied source,
 prompts a fine-tuned writer, checks the output, and returns an article. A
 separate LangChain Studio agent can research the web (parallel Tavily
-searches), calls that same writer through a tool, designs a branded page, and
+searches), calls that same writer through a tool, adds a GPT Image 2.5 hero
+image generated in parallel, designs a branded page, and
 offers a preview and explicit publishing action in a Next.js app. The agent
 never substitutes its own prose for the writer's article.
 

@@ -12,9 +12,9 @@ on Jenosize's own articles.
 
 | What | Link |
 | --- | --- |
-| Web app (chat with the content agent, preview, publish) | **WEB_URL** |
+| Web app (chat with the content agent, preview, publish) · login shared privately | https://jenosize-trend-writer.vercel.app |
 | Article API: FastAPI, interactive docs | https://khemmapich--jenosize-trend-writer-article-api.modal.run/docs |
-| In-app docs (how it works, fine-tuning, results) | **WEB_URL**/docs |
+| In-app docs (how it works, fine-tuning, results) | https://jenosize-trend-writer.vercel.app/docs |
 
 The GPU scales to zero when idle, so **the first request after a quiet spell
 takes 1–3 minutes** while the model loads. The web app wakes it on page load,
@@ -76,8 +76,10 @@ brief ─► normalize + validate ─► (optional) fetch source → chunk → B
   with base model + every adapter version by name, plus the `jeno-lora` alias
   for the active one. It scales to zero.
 - **Agent** (`ai-services/studio/`): a LangChain agent that can research the
-  web (Tavily, parallel searches), call the fine-tuned writer as a tool, design
-  a branded HTML page, and publish it. The agent never substitutes its own
+  web (Tavily, parallel searches), call the fine-tuned writer as a tool, add a
+  GPT Image 2.5 hero image (generated while the article is written), design a
+  branded HTML page, and publish it. Every step (inputs, progress, results,
+  timing) is shown live in the chat and saved with the conversation. The agent never substitutes its own
   prose for the writer's article.
 
 Details: [`ai-services/docs/architecture.md`](ai-services/docs/architecture.md),

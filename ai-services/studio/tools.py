@@ -7,12 +7,14 @@ fine-tuned model is still writing it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
 import json
 import re
 from dataclasses import dataclass
+from html import escape
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -65,7 +67,120 @@ def _summary(**fields: Any) -> str:
     return json.dumps(fields, default=str, ensure_ascii=False)
 
 
+def hero_prompt(request: ArticleRequest) -> str:
+    """The brief for an article's lead image, built from the article brief.
+
+    Built from the brief rather than the finished text so the image can be
+    generated while the fine-tuned model is still writing.
+    """
+    angle = ", ".join(
+        part
+        for part in (
+            request.industry and f"industry: {request.industry}",
+            request.audience and f"for {request.audience}",
+            request.keywords and "themes: " + ", ".join(request.keywords[:5]),
+        )
+        if part
+    )
+    return (
+        f"Editorial hero image for a business trends article titled around: {request.topic}."
+        + (f" ({angle})." if angle else "")
+        + " Style: modern, optimistic, premium consulting magazine; clean composition with"
+        " depth, soft natural light, a restrained palette of deep navy, electric blue and"
+        " cyan accents on white. Photographic or refined 3D illustration. No text, letters,"
+        " logos, watermarks or UI screenshots; no recognisable real people."
+    )
+
+
 def build_tools(ctx: ToolContext) -> list[BaseTool]:
+    async def create_image(
+        prompt: str, *, filename: str, alt_text: str | None, size: str | None, tool_name: str
+    ) -> dict[str, Any]:
+        """Generate one image with GPT Image, validate it and save it as a thread asset.
+
+        Returns the asset fields, or {"error": ...}; never raises, so a failed
+        image can't take the article down with it.
+        """
+        if not ctx.settings.image_api_key:
+            return {"error": "image generation is not configured (set OPENAI_API_KEY)"}
+
+        emit(
+            "tool_progress",
+            tool=tool_name,
+            message=f"Generating an image with {ctx.settings.image_model}…",
+        )
+        try:
+            from openai import AsyncOpenAI
+
+            async with AsyncOpenAI(
+                api_key=ctx.settings.image_api_key,
+                base_url=ctx.settings.image_base_url.rstrip("/"),
+                timeout=ctx.settings.image_timeout_s,
+                max_retries=2,
+            ) as client:
+                result = await client.images.generate(
+                    model=cast(Any, ctx.settings.image_model),
+                    prompt=prompt[:32_000],
+                    size=cast(Any, size or ctx.settings.image_size),
+                    quality=cast(Any, ctx.settings.image_quality),
+                    # JPEG keeps a 1536x1024 hero around 200-300 KB instead of ~2 MB PNG.
+                    output_format="jpeg",
+                    output_compression=85,
+                )
+            items = result.data or []
+            encoded = getattr(items[0], "b64_json", None) if items else None
+            if not encoded:
+                return {"error": "image provider returned no image bytes"}
+            data = base64.b64decode(encoded)
+        except Exception as exc:
+            logger.exception("image_generation_failed", extra={"thread_id": str(ctx.thread_id)})
+            return {"error": f"image generation failed: {type(exc).__name__}"}
+
+        from PIL import Image
+
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                content_type = Image.MIME.get(image.format or "PNG", "image/png")
+        except Exception as exc:
+            return {"error": f"generated image failed validation: {type(exc).__name__}"}
+
+        asset_id = uuid4()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-") or "generated.png"
+        safe_name = re.sub(r"\.[A-Za-z0-9]+$", "", safe_name) + ".jpg"
+        key = f"assets/{asset_id}/{safe_name}"
+        await ctx.storage.put_bytes(key, data, content_type=content_type)
+        asset = await ctx.store.add_asset(
+            id=asset_id,
+            thread_id=ctx.thread_id,
+            filename=safe_name,
+            content_type=content_type,
+            bytes=len(data),
+            width=width,
+            height=height,
+            sha256=hashlib.sha256(data).hexdigest(),
+            r2_key=key,
+        )
+        emit(
+            "asset",
+            asset_id=str(asset_id),
+            filename=safe_name,
+            width=width,
+            height=height,
+            generated=True,
+        )
+        return {
+            "asset_id": asset["id"],
+            "filename": safe_name,
+            "width": width,
+            "height": height,
+            "generated": True,
+            "model": ctx.settings.image_model,
+            "alt_text": alt_text or prompt[:180],
+        }
+
     @tool
     async def write_article(
         topic: str,
@@ -102,6 +217,22 @@ def build_tools(ctx: ToolContext) -> list[BaseTool]:
             artifact = await ctx.store.create_artifact(ctx.thread_id, title=topic)
         emit("artifact_start", artifact_id=str(artifact["id"]), title=topic, writer="fine-tuned")
 
+        # One hero image per article (GPT Image), generated in parallel with
+        # the writing so it adds no wait. A rewrite keeps the existing hero.
+        previous = await ctx.store.get_version(artifact["id"]) if artifact_id else None
+        hero_id: str | None = ((previous or {}).get("meta") or {}).get("hero_asset_id")
+        hero_task: asyncio.Task[dict[str, Any]] | None = None
+        if not hero_id and ctx.settings.image_api_key:
+            hero_task = asyncio.create_task(
+                create_image(
+                    hero_prompt(request),
+                    filename="hero.jpg",
+                    alt_text=None,
+                    size=None,
+                    tool_name="write_article",
+                )
+            )
+
         result: dict[str, Any] | None = None
         async for event, payload in ctx.generation.stream(request):
             if event == "token":
@@ -120,21 +251,47 @@ def build_tools(ctx: ToolContext) -> list[BaseTool]:
                     artifact_id=str(artifact["id"]),
                     message=payload.get("message"),
                 )
+                if hero_task:
+                    hero_task.cancel()
                 return _summary(error=payload.get("message", "generation failed"))
 
         if not result:
+            if hero_task:
+                hero_task.cancel()
             return _summary(error="the writer returned no article")
+
+        hero_error: str | None = None
+        if hero_task:
+            if not hero_task.done():
+                emit("tool_progress", tool="write_article", message="Finishing the hero image…")
+            hero = await hero_task
+            hero_id = str(hero["asset_id"]) if "asset_id" in hero else None
+            hero_error = hero.get("error")
+            emit(
+                "tool_progress",
+                tool="write_article",
+                message="Hero image ready" if hero_id else f"No hero image ({hero_error})",
+            )
+
         markdown = f"# {result['title']}\n\n{result['article_markdown']}"
+        body = page.markdown_to_html(markdown)
+        if hero_id:
+            body = page.sanitize(
+                f'<figure class="jz-hero"><img src="asset://{hero_id}" '
+                f'alt="{escape(result["title"], quote=True)}"></figure>' + body
+            )
         version = await ctx.store.add_version(
             artifact["id"],
             markdown=markdown,
-            html=page.markdown_to_html(markdown),
+            html=body,
             meta={
                 "title": result["title"],
                 "meta_description": result.get("meta_description"),
                 "quality_report": result.get("quality_report"),
                 "generation_id": result.get("id"),
                 "model_version": result.get("model_version"),
+                "hero_asset_id": hero_id,
+                "asset_ids": [hero_id] if hero_id else [],
             },
             note="written by the fine-tuned model",
             title=result["title"],
@@ -153,6 +310,9 @@ def build_tools(ctx: ToolContext) -> list[BaseTool]:
             word_count=quality.get("word_count"),
             quality_passed=quality.get("passed"),
             quality_warnings=quality.get("warnings", [])[:4],
+            hero_image_asset_id=hero_id,
+            hero_image_model=ctx.settings.image_model if hero_task and hero_id else None,
+            hero_image_error=hero_error,
         )
 
     @tool
@@ -173,6 +333,9 @@ def build_tools(ctx: ToolContext) -> list[BaseTool]:
             return _summary(error="the artifact has no article yet; call write_article first")
 
         wanted = {i.lower() for i in (image_asset_ids or [])}
+        hero_id = (current.get("meta") or {}).get("hero_asset_id")
+        if hero_id:  # the article's own hero always makes it onto the page
+            wanted.add(str(hero_id).lower())
         images = [a for a in await ctx.store.list_assets(ctx.thread_id) if str(a["id"]) in wanted]
         image_lines = (
             "\n".join(
@@ -258,90 +421,20 @@ def build_tools(ctx: ToolContext) -> list[BaseTool]:
     @tool
     async def generate_image(
         prompt: str,
-        filename: str = "jenosize-generated.png",
+        filename: str = "jenosize-generated.jpg",
         alt_text: str | None = None,
         size: str | None = None,
     ) -> str:
-        """Generate an editorial image and save it as a thread asset.
+        """Generate an extra editorial image (GPT Image) and save it as a thread asset.
 
-        Use this when the user asks for a hero or supporting image and has not
-        supplied a suitable upload. Pass the returned asset_id to
-        `design_page` in `image_asset_ids`.
+        write_article already creates one hero image per article, so use this
+        only when the user asks for another or a different image. Pass the
+        returned asset_id to `design_page` in `image_asset_ids`.
         """
-        if not ctx.settings.image_api_key:
-            return _summary(error="image generation is not configured (set OPENAI_API_KEY)")
-
-        emit("tool_progress", tool="generate_image", message="Generating an editorial image…")
-        try:
-            from openai import AsyncOpenAI
-
-            async with AsyncOpenAI(
-                api_key=ctx.settings.image_api_key,
-                base_url=ctx.settings.image_base_url.rstrip("/"),
-                timeout=ctx.settings.image_timeout_s,
-                max_retries=2,
-            ) as client:
-                result = await client.images.generate(
-                    model=cast(Any, ctx.settings.image_model),
-                    prompt=prompt[:32_000],
-                    size=cast(Any, size or ctx.settings.image_size),
-                    quality=cast(Any, ctx.settings.image_quality),
-                )
-            items = result.data or []
-            if not items:
-                return _summary(error="image provider returned no image bytes")
-            item = items[0]
-            encoded = getattr(item, "b64_json", None)
-            if not encoded:
-                return _summary(error="image provider returned no image bytes")
-            data = base64.b64decode(encoded)
-        except Exception as exc:
-            logger.exception("image_generation_failed", extra={"thread_id": str(ctx.thread_id)})
-            return _summary(error=f"image generation failed: {type(exc).__name__}")
-
-        from PIL import Image
-
-        try:
-            with Image.open(io.BytesIO(data)) as image:
-                image.verify()
-            with Image.open(io.BytesIO(data)) as image:
-                width, height = image.size
-                content_type = Image.MIME.get(image.format or "PNG", "image/png")
-        except Exception as exc:
-            return _summary(error=f"generated image failed validation: {type(exc).__name__}")
-
-        asset_id = uuid4()
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-") or "generated.png"
-        if "." not in safe_name:
-            safe_name += ".png"
-        key = f"assets/{asset_id}/{safe_name}"
-        await ctx.storage.put_bytes(key, data, content_type=content_type)
-        asset = await ctx.store.add_asset(
-            id=asset_id,
-            thread_id=ctx.thread_id,
-            filename=safe_name,
-            content_type=content_type,
-            bytes=len(data),
-            width=width,
-            height=height,
-            sha256=hashlib.sha256(data).hexdigest(),
-            r2_key=key,
-        )
-        emit(
-            "asset",
-            asset_id=str(asset_id),
-            filename=safe_name,
-            width=width,
-            height=height,
-            generated=True,
-        )
         return _summary(
-            asset_id=asset["id"],
-            filename=safe_name,
-            width=width,
-            height=height,
-            generated=True,
-            alt_text=alt_text or prompt[:180],
+            **await create_image(
+                prompt, filename=filename, alt_text=alt_text, size=size, tool_name="generate_image"
+            )
         )
 
     @tool

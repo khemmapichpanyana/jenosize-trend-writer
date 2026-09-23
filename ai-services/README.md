@@ -1,7 +1,7 @@
 # Jenosize Trend Writer
 
-Assignment submission runbook (live curl checks, API verification, Studio E2E,
-and reviewer checklist): [`../SUBMISSION.md`](../SUBMISSION.md).
+Part of the [Jenosize Trend Writer monorepo](../README.md). Live endpoints,
+evidence and the end-to-end verification steps are in the root README.
 
 AI service that generates business trend and future-ideas articles in the voice of
 **Jenosize Ideas**. FastAPI backend + a fine-tuned Qwen3-4B LoRA served on Modal,
@@ -160,8 +160,7 @@ articles were cleaned and labelled in Supabase, and the quality-filtered v2
 dataset (92 train / 13 holdout) is in R2. A QLoRA adapter was trained on a
 Modal L4, is served by vLLM as `jeno-lora-v2`, and is active behind the
 `jeno-lora` alias. The independent v2 comparison and its limitations are in
-[`docs/report.md`](docs/report.md). The Next.js prototype is in the sibling
-`jenosize-ai-content-web/` directory. Local unit/type checks pass; database
+[`docs/report.md`](docs/report.md). The Next.js prototype is in the `../web/` directory. Local unit/type checks pass; database
 integration tests require a disposable Postgres and are skipped otherwise.
 
 ---
@@ -240,7 +239,7 @@ re-run touches only what changed.
 ## Studio: the content agent
 
 A LangChain 1.x agent (`studio/`) served with the jobs API, used from the
-console in `../jenosize-ai-content-web`. **Everything runs on Modal in one
+console in `../web`. **Everything runs on Modal in one
 service**: the HTTP API, the agent workers, the training and eval jobs, and the
 GPU model server.
 

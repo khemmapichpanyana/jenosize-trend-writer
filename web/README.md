@@ -1,7 +1,6 @@
 # Jenosize AI Content — console
 
-For the two-day assignment handoff, use the repository-level
-[`../SUBMISSION.md`](../SUBMISSION.md) runbook.
+Part of the [Jenosize Trend Writer monorepo](../README.md).
 
 The operator console for the Jenosize Trend Writer. From here you can:
 - pull and review the article corpus

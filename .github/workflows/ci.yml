@@ -6,8 +6,11 @@ on:
   pull_request:
 
 jobs:
-  check:
+  ai-services:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-services
 
     # A disposable Postgres for the pipeline's integration tests. The pipeline's
     # correctness lives in SQL ("which rows changed since the last run?"), so it
@@ -32,6 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          cache-dependency-glob: ai-services/uv.lock
 
       - name: Install
         run: uv sync --group dev --group pipeline --group agent --frozen
@@ -68,3 +72,20 @@ jobs:
             echo "::error::a non-runtime dependency leaked into requirements.txt (Vercel 500 MB limit)"
             exit 1
           fi
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npx eslint .
+      - run: npx tsc --noEmit
+      - run: npm run build

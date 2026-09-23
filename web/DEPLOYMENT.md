@@ -64,9 +64,10 @@ npm run lint && npm run build
 npm run start
 ```
 
-Open `http://localhost:3030/studio`. The console currently has no login of its own —
-put it behind an auth layer (e.g. your host's password protection or an SSO
-proxy) before deploying it publicly, since it can start GPU jobs. The public
+Open `http://localhost:3030/studio`. The console asks for one shared login
+(HTTP Basic auth in `proxy.ts`, from `CONSOLE_USER` / `CONSOLE_PASSWORD`),
+since it can start GPU jobs. In production it refuses to serve at all if
+`CONSOLE_PASSWORD` is unset. The public
 `/p/<slug>` share pages are meant to stay accessible. The first browser creates
 one demo thread and stores only that thread id in local storage, so separate
 browsers do not accidentally merge conversations.

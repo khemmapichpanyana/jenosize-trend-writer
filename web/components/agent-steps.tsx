@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronRight, CircleAlert, ExternalLink, Globe, ImageIcon, LayoutTemplate, ListChecks, LoaderCircle, PenLine, Wrench } from "lucide-react";
+import { API } from "@/lib/api";
 import type { ToolCallRecord } from "@/lib/types";
 
 /** One agent tool call, live (from the SSE stream) or saved (from the message). */
@@ -88,6 +89,27 @@ function useNow(active: boolean): number {
 
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
 
+/** The image a finished step produced: a generated image, or an article's hero. */
+function stepImage(step: AgentStep): { id: string; alt: string } | null {
+  if (step.state !== "done" || !step.result) return null;
+  const r = step.result;
+  const id = str(r.asset_id) ?? str(r.hero_image_asset_id);
+  if (!id) return null;
+  return { id, alt: str(r.alt_text) ?? str(r.title) ?? "Generated image" };
+}
+
+/** An image preview inside the trace; opens the full-size image in a new tab. */
+function ImagePreview({ id, alt, caption, className = "mb-1.5 ml-6 mt-0.5" }: { id: string; alt: string; caption?: string | null; className?: string }) {
+  const src = `${API}/studio/assets/${id}/raw`;
+  return (
+    <a href={src} target="_blank" rel="noreferrer" className={`group/img block w-fit ${className} max-w-[18rem] overflow-hidden rounded-lg border border-line/80 bg-surface-2 shadow-[0_4px_14px_rgba(7,19,38,0.06)]`} title="Open full size">
+      {/* eslint-disable-next-line @next/next/no-img-element -- authenticated proxy URL */}
+      <img src={src} alt={alt} loading="lazy" className="aspect-[3/2] w-full object-cover transition-transform duration-300 group-hover/img:scale-[1.02]" />
+      {caption && <span className="block truncate px-2 py-1 text-[10.5px] text-muted">{caption}</span>}
+    </a>
+  );
+}
+
 /** The one-line gist shown next to a step's label. */
 function gist(step: AgentStep): string | null {
   const a = step.args ?? {};
@@ -125,6 +147,10 @@ export function AgentSteps({ steps }: { steps: AgentStep[] }) {
   const total = steps.reduce((sum, s) => sum + (s.durationMs ?? (s.startedAt ? now - s.startedAt : 0)), 0);
   const current = steps.findLast((s) => s.state === "running");
   const errors = steps.filter((s) => s.state === "error").length;
+  const images = steps.flatMap((step) => {
+    const image = stepImage(step);
+    return image ? [{ step, image }] : [];
+  });
   const title = current
     ? `${RUNNING_LABEL[current.name] ?? current.name}…`
     : `${steps.length} step${steps.length === 1 ? "" : "s"}${errors ? ` · ${errors} failed` : ""}`;
@@ -142,6 +168,14 @@ export function AgentSteps({ steps }: { steps: AgentStep[] }) {
         {total > 0 && <span className="tabular-nums text-muted">· {formatMs(total)}</span>}
         <ChevronDown size={12} className={`text-muted transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
+      {/* Collapsed, the images the agent made stay visible as the turn's artifacts. */}
+      {!open && images.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-2">
+          {images.map(({ step, image }) => (
+            <ImagePreview key={step.id} id={image.id} alt={image.alt} caption={step.name === "write_article" ? "Hero image" : str(step.result?.filename)} className="w-44" />
+          ))}
+        </div>
+      )}
       {open && (
         <ol className="mt-1.5 space-y-0.5 border-l border-line pl-3">
           {steps.map((step) => (
@@ -158,6 +192,7 @@ function StepRow({ step, now }: { step: AgentStep; now: number }) {
   const Icon = ICON[step.name] ?? Wrench;
   const elapsed = step.durationMs ?? (step.startedAt ? now - step.startedAt : undefined);
   const line = gist(step);
+  const image = stepImage(step);
   const tone = step.state === "running" ? "text-accent-ink" : step.state === "error" ? "text-critical" : "text-muted";
   return (
     <li className="t-reveal">
@@ -182,6 +217,7 @@ function StepRow({ step, now }: { step: AgentStep; now: number }) {
       {!open && step.state === "running" && step.notes.length > 0 && (
         <p className="truncate pb-1 pl-6 text-[11px] text-muted">{step.notes[step.notes.length - 1]}</p>
       )}
+      {image && <ImagePreview id={image.id} alt={image.alt} caption={step.name === "write_article" ? "Hero image" : str(step.result?.filename)} />}
       {open && <StepDetail step={step} />}
     </li>
   );
@@ -274,9 +310,11 @@ function ResultFields({ name, result }: { name: string; result: Json }) {
       rows.push(["Quality", result.quality_passed ? <span className="text-good">Passed the quality gate</span> : <span className="text-critical">Did not pass</span>]);
     if (Array.isArray(result.quality_warnings) && result.quality_warnings.length) rows.push(["Warnings", (result.quality_warnings as string[]).join(" · ")]);
     if (result.version) rows.push(["Saved as", `version ${result.version}`]);
+    if (str(result.hero_image_model)) rows.push(["Hero image", String(result.hero_image_model)]);
+    if (str(result.hero_image_error)) rows.push(["Hero image", <span key="hero-error" className="text-critical">{String(result.hero_image_error)}</span>]);
   } else {
     for (const [key, value] of Object.entries(result)) {
-      if (key === "excerpt" || key === "text" || value === null || value === undefined) continue;
+      if (["excerpt", "text", "asset_id", "artifact_id", "generated", "alt_text"].includes(key) || value === null || value === undefined) continue;
       rows.push([key.replace(/_/g, " "), typeof value === "object" ? JSON.stringify(value) : String(value)]);
     }
   }

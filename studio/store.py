@@ -41,10 +41,27 @@ class StudioStore:
         return row
 
     async def list_threads(self, limit: int = 50) -> list[dict[str, Any]]:
+        # Aggregate each table once (grouped by thread_id) and join the totals in,
+        # rather than a correlated subquery per column that re-scans per thread row.
         return await self._all(
             """
-            select t.*, (select count(*) from artifacts a where a.thread_id = t.id) as artifact_count
-            from chat_threads t order by updated_at desc limit %s
+            select t.*,
+              coalesce(ac.n, 0) as artifact_count,
+              coalesce(mc.n, 0) as message_count,
+              coalesce(mc.tool_n, 0) as agent_call_count
+            from chat_threads t
+            left join (
+              select thread_id, count(*) as n from artifacts group by thread_id
+            ) ac on ac.thread_id = t.id
+            left join (
+              select thread_id,
+                count(*) as n,
+                count(*) filter (
+                  where jsonb_array_length(coalesce(tool_calls, '[]'::jsonb)) > 0
+                ) as tool_n
+              from chat_messages group by thread_id
+            ) mc on mc.thread_id = t.id
+            order by t.updated_at desc limit %s
             """,
             (limit,),
         )
@@ -139,6 +156,41 @@ class StudioStore:
             "select * from artifacts where thread_id = %s order by created_at", (thread_id,)
         )
 
+    async def list_generated(
+        self,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        limit: int = 24,
+        offset: int = 0,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Return draft and published artifacts without loading every conversation."""
+        source = """
+            from artifacts a
+            left join lateral (
+                select slug from published_content p
+                where p.artifact_id = a.id and p.status = 'published'
+                order by p.updated_at desc limit 1
+            ) published on true
+            where a.current_version > 0
+              and (%s::text is null or a.title ilike concat('%%', %s::text, '%%'))
+              and (%s::text is null or
+                   case when published.slug is null then 'draft' else 'published' end = %s)
+        """
+        filters = (query, query, status, status)
+        async with self._conn.cursor() as cur:
+            await cur.execute("select count(*) as n " + source, filters)
+            total = int((await cur.fetchone() or {"n": 0})["n"])
+            await cur.execute(
+                "select a.id, a.thread_id, a.title, a.current_version, a.updated_at, "
+                "published.slug, "
+                "case when published.slug is null then 'draft' else 'published' end as status "
+                + source
+                + " order by a.updated_at desc, a.id desc limit %s offset %s",
+                (*filters, limit, offset),
+            )
+            return total, list(await cur.fetchall())
+
     async def get_version(
         self, artifact_id: UUID, version: int | None = None
     ) -> dict[str, Any] | None:
@@ -232,10 +284,31 @@ class StudioStore:
     async def get_published(self, slug: str) -> dict[str, Any] | None:
         return await self._one("select * from published_content where slug = %s", (slug,))
 
-    async def list_published(self, limit: int = 100) -> list[dict[str, Any]]:
-        return await self._all(
-            "select * from published_content order by updated_at desc limit %s", (limit,)
+    async def list_published(
+        self,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        limit: int = 24,
+        offset: int = 0,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        filters = (
+            "(%s::text is null or title ilike concat('%%', %s::text, '%%')"
+            " or slug ilike concat('%%', %s::text, '%%'))"
+            " and (%s::text is null or status = %s)"
         )
+        filter_params = (query, query, query, status, status)
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"select count(*) as n from published_content where {filters}", filter_params
+            )
+            total = int((await cur.fetchone() or {"n": 0})["n"])
+            await cur.execute(
+                f"select * from published_content where {filters} order by updated_at desc "
+                "limit %s offset %s",
+                (*filter_params, limit, offset),
+            )
+            return total, list(await cur.fetchall())
 
     async def published_for_artifact(self, artifact_id: UUID) -> list[dict[str, Any]]:
         return await self._all(

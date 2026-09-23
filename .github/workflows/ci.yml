@@ -55,12 +55,12 @@ jobs:
           PERSISTENCE: none
           STORAGE: local
         run: |
-          uv run uvicorn app.main:app --port 8000 &
+          uv run uvicorn app.main:app --port 8777 &
           for _ in $(seq 1 30); do
-            curl -fsS http://localhost:8000/api/v1/health >/dev/null && break
+            curl -fsS http://localhost:8777/api/v1/health >/dev/null && break
             sleep 1
           done
-          ./scripts/smoke_test.sh http://localhost:8000
+          ./scripts/smoke_test.sh http://localhost:8777
 
       - name: Check the Vercel bundle stays light
         run: |

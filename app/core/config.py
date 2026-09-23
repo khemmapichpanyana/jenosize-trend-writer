@@ -37,16 +37,27 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_version: str = "0.1.0"
     log_level: str = "INFO"
-    public_base_url: str = "http://localhost:8000"
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
+    port: int = Field(default=8777, validation_alias="PORT")
+    public_base_url: str = "http://localhost:8777"
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8777"])
     api_key: str | None = None
 
     # --- model ---------------------------------------------------------------
     model_provider: ModelProvider = "mock"
-    model_base_url: str | None = None
-    model_api_key: str | None = None
+    model_base_url: str | None = Field(
+        default=None, validation_alias=AliasChoices("MODEL_BASE_URL", "VLLM_BASE_URL")
+    )
+    model_api_key: str | None = Field(
+        default=None, validation_alias=AliasChoices("MODEL_API_KEY", "VLLM_API_KEY")
+    )
     model_name: str = "jeno-lora"
     model_timeout_s: float = 240.0
+    # A serverless GPU can return 502/503/504 while its container is cold. The
+    # provider retries only those transient failures; validation errors (400)
+    # still fail immediately. Attempts include the first request.
+    model_retry_attempts: int = Field(default=5, ge=1, le=8)
+    model_retry_initial_s: float = Field(default=10.0, ge=0.0, le=120.0)
+    model_retry_max_s: float = Field(default=60.0, ge=0.0, le=300.0)
 
     # --- persistence ---------------------------------------------------------
     persistence: Persistence = "none"
@@ -97,9 +108,9 @@ class Settings(BaseSettings):
 
     # --- studio agent (studio/, served by the jobs API on Modal) --------------
     # The agent's *orchestrating* model. It runs on the same Modal vLLM server as
-    # the fine-tuned writer (MODEL_BASE_URL) but uses the base weights: the LoRA
-    # is trained on the article output format, not on tool calling. The writing
-    # itself goes through the fine-tuned model (MODEL_NAME) via write_article.
+    # the writer. The default is base Qwen for reliable tool calling, but the
+    # deployed demo can set AGENT_MODEL to jeno-lora to exercise the adapter first.
+    # Article writing always goes through MODEL_NAME via write_article.
     agent_model: str = "Qwen/Qwen3-4B-Instruct-2507"
     # "mock": a deterministic stand-in that drives the real tools, for local
     # demos and tests without a GPU or LLM account (like MODEL_PROVIDER=mock).
@@ -109,9 +120,21 @@ class Settings(BaseSettings):
     agent_fallback_base_url: str | None = None
     agent_fallback_api_key: str | None = None
     agent_fallback_model: str | None = None
+    # Optional server-side image generation for the Studio agent.
+    image_api_key: str | None = Field(
+        default=None, validation_alias=AliasChoices("IMAGE_API_KEY", "OPENAI_API_KEY")
+    )
+    image_base_url: str = "https://api.openai.com/v1"
+    image_model: str = "gpt-image-2"
+    image_size: str = "1536x1024"
+    image_quality: str = "medium"
+    image_timeout_s: float = Field(default=180.0, ge=10.0, le=600.0)
     # Base URL for shared links, e.g. the console's domain (which proxies /p/*).
     # Unset: links point at this API itself.
     public_share_base_url: str | None = None
+    # Optional web search for the Studio agent's research tool (Tavily). Unset:
+    # web_search is omitted from the agent's tools entirely.
+    tavily_api_key: str | None = Field(default=None, validation_alias="TAVILY_API_KEY")
 
     # --- offline labeling (pipeline only, unused by the API) -----------------
     labeler_base_url: str | None = None

@@ -1,4 +1,4 @@
-"""The model side: training, evaluation, adapters, publishing."""
+"""The model side: training, evaluation and adapters."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from app.core.errors import NotFoundError
 from pipeline.api.deps import GUARDED, DispatcherDep, Stores
 from pipeline.api.runs import start_job
 from pipeline.api.schemas import Adapter, JobRun
-from pipeline.jobs import VERSION_PATTERN, EvalParams, PublishParams, TrainParams
+from pipeline.jobs import VERSION_PATTERN, EvalParams, TrainParams
 
 router = APIRouter(prefix="/v1", dependencies=GUARDED)
 Version = Path(pattern=VERSION_PATTERN)
@@ -62,18 +62,3 @@ async def activate_adapter(dispatcher: DispatcherDep, version: str = Version) ->
         raise NotFoundError(f"no trained adapter for {version}")
     await dispatcher.activate_adapter(version)
     return await list_adapters(dispatcher)
-
-
-@router.post(
-    "/adapters/{version}/publish", status_code=202, response_model=JobRun, tags=["adapters"]
-)
-async def publish_adapter(
-    pair: Stores, dispatcher: DispatcherDep, body: PublishParams, version: str = Version
-) -> JSONResponse:
-    """Upload a trained adapter to the Hugging Face Hub (a job)."""
-    found, _ = await dispatcher.list_adapters()
-    if not any(a["version"] == version for a in found):
-        raise NotFoundError(f"no trained adapter for {version}")
-    return await start_job(
-        dispatcher, pair[1], "publish", body.model_copy(update={"version": version})
-    )

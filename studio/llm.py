@@ -28,15 +28,28 @@ class NoAgentModelError(RuntimeError):
     pass
 
 
-def _chat(base_url: str, api_key: str | None, model: str, *, timeout: float) -> ChatOpenAI:
+def _chat(
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    *,
+    timeout: float,
+    max_retries: int,
+) -> ChatOpenAI:
+    # OpenAI reasoning models reject function tools on the legacy
+    # `/v1/chat/completions` route unless reasoning is explicitly disabled.
+    # The Modal Qwen/LoRA endpoint does not need this field, so keep it scoped
+    # to the OpenAI-style reasoning model names used by the fallback.
+    reasoning_effort = "none" if model.lower().startswith(("gpt-5", "o1", "o3", "o4")) else None
     return ChatOpenAI(
         base_url=base_url.rstrip("/"),
         api_key=api_key or "not-needed",  # type: ignore[arg-type]
         model=model,
         temperature=0.3,
         timeout=timeout,
-        max_retries=1,
+        max_retries=max_retries,
         streaming=True,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -56,6 +69,7 @@ def build_agent_models(settings: Settings) -> AgentModels:
                     settings.model_api_key,
                     settings.agent_model,
                     timeout=settings.model_timeout_s,
+                    max_retries=max(0, settings.model_retry_attempts - 1),
                 ),
             )
         )
@@ -63,7 +77,18 @@ def build_agent_models(settings: Settings) -> AgentModels:
     fb_model = settings.agent_fallback_model or settings.labeler_model
     fb_key = settings.agent_fallback_api_key or settings.labeler_api_key
     if fb_url and fb_model:
-        candidates.append((f"fallback:{fb_model}", _chat(fb_url, fb_key, fb_model, timeout=120)))
+        candidates.append(
+            (
+                f"fallback:{fb_model}",
+                _chat(
+                    fb_url,
+                    fb_key,
+                    fb_model,
+                    timeout=120,
+                    max_retries=min(3, max(0, settings.model_retry_attempts - 1)),
+                ),
+            )
+        )
     if not candidates:
         raise NoAgentModelError(
             "No agent model configured: set MODEL_PROVIDER=openai_compatible + MODEL_BASE_URL "

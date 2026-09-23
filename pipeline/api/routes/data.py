@@ -89,11 +89,12 @@ async def list_articles(
     pair: Stores,
     state: ArticleState = "all",
     category: str | None = None,
+    q: str | None = Query(None, min_length=1, max_length=200),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> ArticlePage:
     total, items = await pair[0].list_articles(
-        state=state, category=category, limit=limit, offset=offset
+        state=state, category=category, query=q, limit=limit, offset=offset
     )
     return ArticlePage(total=total, limit=limit, offset=offset, items=[_summary(a) for a in items])
 
@@ -214,6 +215,7 @@ async def publish_dataset(
                     eval_frac=request.eval_frac,
                     seed=request.seed,
                     overwrite=request.overwrite,
+                    quality_filter=request.quality_filter,
                 )
             )
     except build_dataset.DatasetError as exc:

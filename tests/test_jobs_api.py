@@ -26,7 +26,7 @@ KEY = {"X-API-Key": "test-key"}
 
 
 class FakeGpu:
-    """Stands in for the Modal functions (train / eval / publish)."""
+    """Stands in for the Modal functions (train / eval)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -35,11 +35,6 @@ class FakeGpu:
         self.calls.append((kind, params))
         if kind == "train":
             return {"train_loss": 1.23, "steps": 10}
-        if kind == "publish":
-            return {
-                "repo_id": params["repo_id"],
-                "url": f"https://huggingface.co/{params['repo_id']}",
-            }
         return {"summary": {"n_briefs": 2}, "results": ["large", "payload"]}
 
 
@@ -463,6 +458,15 @@ async def test_adapters_list_and_activate(api: AsyncClient, settings: Settings) 
     assert (await api.post("/v1/adapters/v7/activate", headers=KEY)).status_code == 404
 
 
+async def test_adapter_publication_is_not_exposed(api: AsyncClient) -> None:
+    response = await api.post(
+        "/v1/adapters/v1/publish",
+        headers=KEY,
+        json={"version": "v1", "repo_id": "me/jeno-lora"},
+    )
+    assert response.status_code == 404
+
+
 async def test_eval_requires_a_trained_adapter(
     api: AsyncClient,
     dispatcher: InlineDispatcher,
@@ -475,27 +479,3 @@ async def test_eval_requires_a_trained_adapter(
     )
     assert response.status_code == 404
     assert "POST /v1/train" in response.json()["error"]["message"]
-
-
-async def test_publish_is_a_job(
-    api: AsyncClient, dispatcher: InlineDispatcher, gpu: FakeGpu, settings: Settings
-) -> None:
-    _fake_adapter(Path(settings.models_dir), "v1")
-    response = await api.post(
-        "/v1/adapters/v1/publish", headers=KEY, json={"version": "v1", "repo_id": "me/jeno-lora"}
-    )
-    run = await _finish(api, dispatcher, response)
-    assert run["status"] == "succeeded"
-    assert run["result"]["url"] == "https://huggingface.co/me/jeno-lora"
-    assert gpu.calls[-1] == (
-        "publish",
-        {"version": "v1", "repo_id": "me/jeno-lora", "private": False},
-    )
-
-
-async def test_publish_rejects_a_malformed_repo_id(api: AsyncClient, settings: Settings) -> None:
-    _fake_adapter(Path(settings.models_dir), "v1")
-    response = await api.post(
-        "/v1/adapters/v1/publish", headers=KEY, json={"version": "v1", "repo_id": "no-slash"}
-    )
-    assert response.status_code == 422

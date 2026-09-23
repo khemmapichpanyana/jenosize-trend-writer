@@ -16,7 +16,14 @@ from app.schemas.articles import ArticleRequest
 from app.services import normalize
 from app.services import prompt as prompt_service
 from app.services.llm import parse_article
-from pipeline.build_dataset import eligible, meta_for, params_for, to_example
+from pipeline.build_dataset import (
+    MAX_EXAMPLE_CHARS,
+    eligible,
+    meta_for,
+    params_for,
+    to_example,
+    training_quality_issues,
+)
 from pipeline.schemas import ArticleLabels, TrainingArticle
 
 BODY = (
@@ -136,9 +143,49 @@ def test_eligible_keeps_a_complete_article() -> None:
     assert len(eligible([_article()])) == 1
 
 
+def test_curated_quality_audit_rejects_short_unstructured_targets() -> None:
+    issues = training_quality_issues(_article())
+    assert "fewer than 3 H2 sections" not in issues
+    assert "body below 390 words" in issues
+
+
+def test_curated_quality_audit_accepts_a_contract_shaped_target() -> None:
+    paragraph = (
+        "Embedded finance changes how customers discover and use financial services. "
+        "Teams can connect payments, identity, and advice to the journeys they already own. "
+        "Programmable money makes these experiences easier to coordinate. "
+    )
+    body = (
+        paragraph * 8
+        + "\n\n## Why this matters now\n\n"
+        + paragraph * 8
+        + "\n\n## Where value shows up\n\n"
+        + paragraph * 8
+        + "\n\n## How to act\n\n"
+        + paragraph * 8
+    )
+    article = _article(
+        clean_markdown=body,
+        meta_description=(
+            "Embedded finance helps banking leaders connect payments and advice " * 3
+        )[:140],
+    )
+    assert training_quality_issues(article) == []
+
+
 def test_example_carries_traceable_metadata() -> None:
     example = to_example(_article())
     assert example["meta"]["url"].endswith("embedded-finance")
     assert example["meta"]["word_count"] == 600
     # The whole row must be JSON-serialisable: it is written as one JSONL line.
     assert json.loads(json.dumps(example)) == example
+
+
+def test_long_article_is_trimmed_to_the_training_context_budget() -> None:
+    long_body = "Introductory context.\n\n## Main section\n\n" + ("Useful detail. " * 2000)
+    example = to_example(_article(clean_markdown=long_body))
+
+    total = sum(len(message["content"]) for message in example["messages"])
+    assert total <= MAX_EXAMPLE_CHARS
+    assert "## Main section" in example["messages"][2]["content"]
+    assert "[Article truncated" in example["messages"][2]["content"]

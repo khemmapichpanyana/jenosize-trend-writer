@@ -1,5 +1,8 @@
 # Jenosize Trend Writer
 
+Assignment submission runbook (live curl checks, API verification, Studio E2E,
+and reviewer checklist): [`../SUBMISSION.md`](../SUBMISSION.md).
+
 AI service that generates business trend and future-ideas articles in the voice of
 **Jenosize Ideas**. FastAPI backend + a fine-tuned Qwen3-4B LoRA served on Modal,
 with BM25 retrieval over user-supplied sources.
@@ -15,14 +18,14 @@ No cloud accounts, no GPU, no API keys.
 ```bash
 uv sync --group dev          # 1. install (Python 3.12)
 cp .env.example .env         # 2. defaults are already the zero-account mode
-make dev                     # 3. http://localhost:8000/docs
+make dev                     # 3. reads PORT from .env (defaults to 8777)
 ./scripts/smoke_test.sh      # 4. health + generate + stream, in another shell
 ```
 
 Generate an article:
 
 ```bash
-curl -s localhost:8000/api/v1/articles -H 'Content-Type: application/json' -d '{
+curl -s localhost:8777/api/v1/articles -H 'Content-Type: application/json' -d '{
   "topic": "Agentic AI in Southeast Asian retail",
   "category": "Futurist",
   "industry": "ecommerce",
@@ -35,7 +38,7 @@ curl -s localhost:8000/api/v1/articles -H 'Content-Type: application/json' -d '{
 Stream it (SSE):
 
 ```bash
-curl -N localhost:8000/api/v1/articles/stream -H 'Content-Type: application/json' \
+curl -N localhost:8777/api/v1/articles/stream -H 'Content-Type: application/json' \
   -d '{"topic":"The future of embedded finance","industry":"fintech","length":"short"}'
 ```
 
@@ -64,7 +67,7 @@ Client ──► Vercel: FastAPI backend (trend-writer.workser.app)
               └─► Modal: vLLM OpenAI-compatible server
                          (Qwen3-4B-Instruct-2507 + LoRA adapter, scale to zero)
                          ▲
-Modal: train.py (Unsloth LoRA) ─┘ adapter → Modal Volume + Hugging Face Hub
+Modal: train.py (Unsloth LoRA) ─┘ adapter → private Modal Volume
 ```
 
 Vercel does CPU work only. **No ML dependency may enter `requirements.txt`** —
@@ -141,25 +144,25 @@ pipeline/            ✅ scrape · clean · label · build_dataset · jobs · ap
 modal/               ✅ jobs API · train (QLoRA) · serve (vLLM + LoRA) · eval · doctor · deploy
 supabase/migrations/ 0001_init.sql — 7 tables, RLS enabled, no policies
 tests/               services · API (mock) · pipeline on real Postgres + S3 · prompt parity
-docs/                architecture.md · report.md (outline) · data_card.md (template)
+docs/                architecture.md · report.md · data_card.md
 scripts/             smoke_test.sh · gen_requirements.sh
 ```
 
-### Done vs stubbed
+### Current assignment checkpoint (2026-09-22)
 
 **Done and tested** — the whole API surface, the A→F generation flow, both
 transports, normalization, chunking + BM25 retrieval, the quality gate with its
 retry, ingestion of URLs and documents, all three seams with every
 implementation, the SQL schema, structured logging, the error model, CI.
 
-**Implemented but not yet run at full scale.** The data pipeline was run
-against the live site into Postgres 17 plus an S3-compatible R2 stand-in:
-discovery, crawl, clean and re-check all behaved incrementally. It hasn't
-written to your real Supabase or R2 yet, since that needs your credentials.
-Labelling needs your `LABELER_*` endpoint. The Modal
-jobs (`train.py`, `serve.py`, `eval.py`) import and construct cleanly against
-Modal 1.5.5 but have not executed on a GPU yet. `prompt.STYLE_RULES` is still a
-first draft. The browser demo page is not in this repo yet.
+**Executed on the real services.** Sitemap discovery found 174 URLs; 159
+articles were cleaned and labelled in Supabase, and the quality-filtered v2
+dataset (92 train / 13 holdout) is in R2. A QLoRA adapter was trained on a
+Modal L4, is served by vLLM as `jeno-lora-v2`, and is active behind the
+`jeno-lora` alias. The independent v2 comparison and its limitations are in
+[`docs/report.md`](docs/report.md). The Next.js prototype is in the sibling
+`jenosize-ai-content-web/` directory. Local unit/type checks pass; database
+integration tests require a disposable Postgres and are skipped otherwise.
 
 ---
 
@@ -189,6 +192,8 @@ behaviour:
 | `MODEL_BASE_URL` | — | `https://<workspace>--jenosize-trend-writer-vllmserver.modal.run/v1` |
 | `MODEL_NAME` | `jeno-lora` | Use the base model id until the adapter is trained |
 | `MODEL_TIMEOUT_S` | `240` | A cold L4 takes 1–2 minutes to first token |
+| `MODEL_RETRY_ATTEMPTS` | `5` | Total attempts for transient connection/408/429/5xx errors (includes the first) |
+| `MODEL_RETRY_INITIAL_S` / `MODEL_RETRY_MAX_S` | `10` / `60` | Exponential backoff while a serverless vLLM container starts |
 | `PERSISTENCE` | `none` | `supabase` needs `SUPABASE_URL` + `SUPABASE_SECRET_KEY` |
 | `STORAGE` | `local` | `r2` needs the three `R2_*` credentials |
 | `API_KEY` | unset | When set, POST routes require `X-API-Key` |
@@ -217,7 +222,7 @@ POST /v1/label/preview → /v1/label    reverse-label (preview one first)
 POST /v1/datasets {"version":"v1"}    publish an immutable, validated dataset
 POST /v1/train    {"version":"v1"}    QLoRA on a Modal L4
 POST /v1/eval     {"version":"v1", "endpoint": …, "judge": true}
-POST /v1/adapters/v1/activate · /publish
+POST /v1/adapters/v1/activate
 ```
 
 The pipeline writes **only to Postgres and Cloudflare R2**, and every stage is
@@ -252,15 +257,20 @@ that dies is marked failed on the next read.
 
 | Piece | What it does |
 |---|---|
-| Orchestrator | `AGENT_MODEL` (base Qwen) on the same Modal vLLM server, with an optional fallback LLM (`ModelFallbackMiddleware`). Model and tool call limits cap runaway turns |
+| Orchestrator | `AGENT_MODEL` (base Qwen by default; the demo can set `jeno-lora` to try the adapter first) on the same Modal vLLM server, with an optional fallback LLM (`ModelFallbackMiddleware`). Model and tool call limits cap runaway turns |
 | `write_article` | Always the **fine-tuned `jeno-lora`**, through the same `GenerationService` as the article API. Its tokens stream live into the artifact panel |
 | `design_page` | Lays the article out as a branded page using `studio/brand/` (placeholder brand context plus a theme). Output is sanitised to an allowlist; invented images or dropped content fall back to the standard layout |
+| `generate_image` | Optional server-side GPT Image 2 tool. It stores the generated image as a private thread asset and returns its id so `design_page` can use it; the browser never receives the OpenAI key |
 | Artifacts | Immutable versions (markdown plus page HTML) |
 | Assets | Images are decoded before storing, and stay private in R2 |
 | Publish | A person's action: freezes a version at `/p/{slug}` with a no-script CSP; only the images that page references become public |
 | Live training | The GPU job writes per-step loss and NVML GPU telemetry; `GET /v1/runs/{id}/events` streams it; `GET /v1/resources` shows Modal containers |
 
-Run it locally with no accounts: `MODEL_PROVIDER=mock AGENT_PROVIDER=mock`. The
+Run it locally with no accounts: `MODEL_PROVIDER=mock AGENT_PROVIDER=mock`. To enable
+image generation in a deployed Studio, set `OPENAI_API_KEY` in the server-side
+`.env`, run `make modal-secrets`, and redeploy. Keep this key out of the web
+console's `.env.local`; image generation is deliberately opt-in because each
+call is billable. The
 mock agent drives the real tools, streaming and publishing, and says it's a mock
 in its replies.
 
@@ -292,7 +302,6 @@ deny by default; only the service key gets through.
 ```bash
 uv sync --group modal
 uv run modal setup
-uv run modal secret create jeno-hf    HF_TOKEN=...
 uv run modal secret create jeno-vllm  VLLM_API_KEY=...
 uv run modal secret create jeno-r2    R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=jenosize-trend-writer
 uv run modal deploy modal/serve.py   # prints the URL for MODEL_BASE_URL
@@ -324,6 +333,7 @@ so the endpoint is usable before training lands.
 ```bash
 make install   # uv sync --group dev
 make dev       # uvicorn with autoreload
+make dev-assignment  # one process; combined Swagger at /docs, jobs under /jobs
 make test      # pytest
 make lint      # ruff check + ruff format --check + mypy
 make fmt       # ruff format + ruff check --fix

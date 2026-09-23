@@ -1,6 +1,6 @@
 # Fine-tuning workflow (API-driven)
 
-From jenosize.com/en/ideas to a served, evaluated and published LoRA adapter.
+From jenosize.com/en/ideas to a served and evaluated LoRA adapter.
 **After a one-time bootstrap of three commands, every step is an HTTP call** to
 the jobs API. Every call can be repeated safely, and nothing lives only on a
 laptop.
@@ -44,7 +44,7 @@ The API can't deploy itself, so these three steps run from a terminal:
 uv sync --group dev --group pipeline --group modal
 uv run modal setup          # 1. log in to Modal (browser)
 make modal-secrets          # 2. create the Modal secrets from .env
-make deploy-modal           # 3. deploy jobs API + vLLM + train/eval/publish
+make deploy-modal           # 3. deploy jobs API + vLLM + train/eval
 ```
 
 `.env` needs these keys before step 2. `make modal-secrets` gives each Modal
@@ -56,7 +56,7 @@ secret only the keys it uses, and never prints a value.
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_API_ENDPOINT`, `R2_JENOSIZE_BUCKET` | everything that reads or writes R2 |
 | `JOBS_API_KEY` (`openssl rand -hex 24`) | the `X-API-Key` header on every `/v1` call |
 | `LABELER_BASE_URL`, `LABELER_API_KEY`, `LABELER_MODEL` | reverse-labelling (any OpenAI-compatible model) |
-| `HF_TOKEN` (write), `VLLM_API_KEY` (`openssl rand -hex 24`) | publishing, and the vLLM server's bearer token |
+| `VLLM_API_KEY` (`openssl rand -hex 24`) | the vLLM server's bearer token |
 
 Before step 3, turn off public access on the bucket (Cloudflare → R2 → bucket
 → Settings → Public Development URL → Disable). It holds scraped third-party
@@ -81,8 +81,7 @@ names, never values.
 
 ## Jobs: how every long-running call behaves
 
-`POST /v1/scrape`, `/v1/label`, `/v1/train`, `/v1/eval` and
-`/v1/adapters/{v}/publish` return **`202` with a run id straight away**. The
+`POST /v1/scrape`, `/v1/label`, `/v1/train` and `/v1/eval` return **`202` with a run id straight away**. The
 work runs in its own Modal container. Poll `GET /v1/runs/{id}` to follow it:
 the response shows the status, the result, and stats for each stage.
 
@@ -193,6 +192,25 @@ Then check it: `GET /v1/datasets/v1/validate`, `GET /v1/datasets/v1/card`
 sees them). The split is by `sha256(url)`, so new articles never move an
 existing one between train and eval.
 
+### Curated v2 training set
+
+The original `v1` bytes and its 13-example evaluation split are immutable. For
+the next adapter iteration, publish a new version with the opt-in quality
+filter:
+
+```bash
+curl -sS -X POST "$JOBS/v1/datasets" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"version":"v2","eval_frac":0.1,"seed":13,"quality_filter":true}' | jq
+```
+
+The filter applies only to training rows and reports its exclusions. It keeps
+the URL-hash evaluation assignment unchanged, so v1 and v2 remain comparable.
+Rows are excluded when the rendered assistant target violates the production
+contract (title/meta bounds, fewer than three H2 sections, insufficient length,
+or low keyword coverage). If the response reports too many exclusions, review
+the labels and source articles before spending GPU time; do not overwrite v1.
+
 ## 5. Train: `POST /v1/train {"version": "v1"}` (~15-30 min on an L4)
 
 Start with `{"version": "v1", "epochs": 1}`, which costs about $0.50 and proves
@@ -235,15 +253,22 @@ differs. It reports:
 Per-example outputs go to `eval/{run}/results.json` in R2. Put the summary table
 in `docs/report.md`.
 
+The evaluator probes `<vllm-root>/health` before its first completion and waits
+through a scale-to-zero cold start. It also retries transient `502`/`503`/`504`
+responses with bounded backoff, so `no upstreams available` no longer fails an
+entire evaluation immediately. `EVAL_READY_TIMEOUT_S` (default 900 seconds),
+`EVAL_READY_POLL_S` (15 seconds), and the existing `MODEL_RETRY_*` variables
+can tune this behavior.
+
+For serverless cold-start latency, the vLLM service defaults to
+`--enforce-eager`, which skips CUDA-graph compilation. Set
+`VLLM_ENFORCE_EAGER=0` only when a warm, continuously running container makes
+throughput more important than first-request latency. `VLLM_MAX_MODEL_LEN` can
+also be reduced from its 8192 default when prompts never need the longer
+retrieval context.
+
 The article API then points at it with `MODEL_PROVIDER=openai_compatible`,
 `MODEL_BASE_URL=<vllm>/v1` and `MODEL_NAME=jeno-lora`.
-
-## 7. Publish: `POST /v1/adapters/v1/publish {"repo_id": "you/jeno-trend-writer-lora"}`
-
-This is a job that uploads the evaluated adapter to Hugging Face. It's separate
-from training, so only an adapter that has been evaluated gets published.
-
----
 
 ## Re-running later (new articles on the site)
 
@@ -259,8 +284,8 @@ POST /v1/adapters/v2/activate              if it wins
 ## Local development (optional)
 
 `make jobs-dev` runs the same API on `http://localhost:8001` against your real
-Postgres and R2, with scrape and label running in-process (train, eval and
-publish need Modal). The `make scrape|clean|label|dataset` targets still exist
+Postgres and R2, with scrape and label running in-process (train and eval need
+Modal). The `make scrape|clean|label|dataset` targets still exist
 for debugging a single stage; they call the same code as the API.
 
 ## Where things live

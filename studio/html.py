@@ -57,6 +57,13 @@ def theme_css() -> str:
     return (BRAND_DIR / "theme.css").read_text(encoding="utf-8")
 
 
+def logo_svg() -> str:
+    """The official logo, inlined into the page shell (a trusted brand file, not
+    agent output, so it bypasses `sanitize`; published pages' no-script CSP still applies)."""
+    svg = (BRAND_DIR / "logo.svg").read_text(encoding="utf-8").strip()
+    return svg.replace("<svg ", '<svg class="jz-logo" role="img" aria-label="Jenosize" ', 1)
+
+
 def sanitize(body: str) -> str:
     return nh3.clean(
         body,
@@ -133,7 +140,7 @@ def render_page(
 </head>
 <body>
 <header class="jz-bar"><div class="jz-bar__inner">
-  <span class="jz-wordmark">Jeno<span>size</span></span>
+  {logo_svg()}
   <span class="jz-tag">Ideas</span>
 </div></header>
 <main class="jz-article">

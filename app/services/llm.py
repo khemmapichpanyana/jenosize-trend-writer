@@ -9,12 +9,13 @@ API layer never imports an SDK directly, so:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
-from collections.abc import AsyncIterator
-from typing import Protocol, cast, runtime_checkable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
-from openai import APIError, APITimeoutError, AsyncOpenAI, AsyncStream
+from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, AsyncStream
 from openai.types.chat import ChatCompletionChunk
 
 from app.core.config import Settings
@@ -22,6 +23,8 @@ from app.core.errors import UpstreamError
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+T = TypeVar("T")
 
 Message = dict[str, str]
 
@@ -177,31 +180,70 @@ class OpenAICompatibleProvider:
         if not settings.model_base_url:
             raise ValueError("MODEL_BASE_URL is required when MODEL_PROVIDER=openai_compatible")
         self._model = settings.model_name
+        self._retry_attempts = settings.model_retry_attempts
+        self._retry_initial_s = settings.model_retry_initial_s
+        self._retry_max_s = settings.model_retry_max_s
         self._client = AsyncOpenAI(
             base_url=settings.model_base_url.rstrip("/"),
             # vLLM requires *some* key; a placeholder keeps the SDK from erroring
             # when the server was started without --api-key.
             api_key=settings.model_api_key or "not-needed",
             # A cold L4 container can take a couple of minutes to load weights,
-            # hence the generous default timeout and no client-side retries
-            # (retrying a cold start just queues another cold start).
+            # hence the generous default timeout. Retries are explicit below so
+            # we can back off 503s without duplicating SDK retry behavior.
             timeout=settings.model_timeout_s,
-            max_retries=1,
+            max_retries=0,
         )
+
+    @staticmethod
+    def _transient(exc: Exception) -> bool:
+        """Return whether retrying can help a serverless model request."""
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return True
+        status = getattr(exc, "status_code", None)
+        return status in {408, 409, 425, 429, 500, 502, 503, 504}
+
+    async def _request(self, operation: Callable[[], Awaitable[T]], *, name: str) -> T:
+        """Run one SDK call with bounded cold-start retries.
+
+        This deliberately wraps only request creation. A streaming response is
+        never replayed after tokens have been emitted, which avoids duplicate
+        article text on a reconnect.
+        """
+        for attempt in range(self._retry_attempts):
+            try:
+                return await operation()
+            except (APIError, APITimeoutError) as exc:
+                last = attempt == self._retry_attempts - 1
+                if last or not self._transient(exc):
+                    raise UpstreamError(f"Model {name} failed: {exc}") from exc
+                delay = min(self._retry_initial_s * (2**attempt), self._retry_max_s)
+                logger.warning(
+                    "model_retry",
+                    extra={
+                        "operation": name,
+                        "attempt": attempt + 1,
+                        "max_attempts": self._retry_attempts,
+                        "delay_s": delay,
+                        "status_code": getattr(exc, "status_code", None),
+                    },
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
 
     async def complete(
         self, messages: list[Message], *, max_tokens: int = 2048
     ) -> GenerationResult:
-        try:
-            resp = await self._client.chat.completions.create(
+        resp = await self._request(
+            lambda: self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=max_tokens,
                 temperature=0.7,
                 top_p=0.9,
-            )
-        except (APIError, APITimeoutError) as exc:
-            raise UpstreamError(f"Model endpoint failed: {exc}") from exc
+            ),
+            name="completion",
+        )
 
         usage = resp.usage
         return GenerationResult(
@@ -214,12 +256,12 @@ class OpenAICompatibleProvider:
     async def stream(
         self, messages: list[Message], *, max_tokens: int = 2048
     ) -> AsyncIterator[str]:
-        try:
-            # `messages` needs a cast to the SDK's TypedDict, which in turn
-            # defeats overload resolution on `stream=True` — hence the cast back.
-            stream = cast(
-                AsyncStream[ChatCompletionChunk],
-                await self._client.chat.completions.create(
+        # `messages` needs a cast to the SDK's TypedDict, which in turn defeats
+        # overload resolution on `stream=True` — hence the cast back.
+        stream = cast(
+            AsyncStream[ChatCompletionChunk],
+            await self._request(
+                lambda: self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,  # type: ignore[arg-type]
                     max_tokens=max_tokens,
@@ -227,25 +269,25 @@ class OpenAICompatibleProvider:
                     top_p=0.9,
                     stream=True,
                 ),
-            )
-            async for event in stream:
-                if not event.choices:
-                    continue
-                if delta := event.choices[0].delta.content:
-                    yield delta
-        except (APIError, APITimeoutError) as exc:
-            raise UpstreamError(f"Model stream failed: {exc}") from exc
+                name="stream",
+            ),
+        )
+        async for event in stream:
+            if not event.choices:
+                continue
+            if delta := event.choices[0].delta.content:
+                yield delta
 
     async def warmup(self) -> None:
         """One-token completion: enough to trigger a container start, cheap if warm."""
-        try:
-            await self._client.chat.completions.create(
+        await self._request(
+            lambda: self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
-            )
-        except (APIError, APITimeoutError) as exc:
-            raise UpstreamError(f"Model warmup failed: {exc}") from exc
+            ),
+            name="warmup",
+        )
 
 
 def build_provider(settings: Settings) -> LLMProvider:

@@ -104,6 +104,13 @@ class DatasetRequest(BaseModel):
     eval_frac: float = Field(0.1, ge=0.0, lt=0.5)
     seed: int = 13
     overwrite: bool = Field(False, description="Replace an existing version (only if untrained).")
+    quality_filter: bool = Field(
+        False,
+        description=(
+            "Curate training rows against the production output contract; "
+            "held-out eval URLs remain unchanged."
+        ),
+    )
 
 
 class DatasetVersion(BaseModel):

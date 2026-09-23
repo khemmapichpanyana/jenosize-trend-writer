@@ -36,6 +36,7 @@ import typer
 
 from app.schemas.articles import TARGET_WORDS, NormalizedParams
 from app.services import prompt as prompt_service
+from app.services import quality
 from app.services.llm import parse_article
 from app.storage.base import Storage, put_text
 from app.storage.keys import dataset_key
@@ -50,6 +51,14 @@ app = typer.Typer(help="Publish versioned train/eval JSONL to R2.")
 META_FALLBACK_CHARS = 155
 # Rough character proxy for MAX_SEQ_LEN=4096 tokens in modal/train.py.
 MAX_EXAMPLE_CHARS = 14000
+TRUNCATION_MARKER = "\n\n[Article truncated to fit the training context window.]\n"
+
+# The normal dataset builder remains backwards-compatible with v1.  A curated
+# v2 can opt into these checks so the adapter is not trained on examples that
+# contradict the production output contract.  Eval rows are never removed by
+# this filter: keeping the URL-hash split intact makes v1/v2 comparisons fair.
+META_MIN_CHARS, META_MAX_CHARS = 120, 160
+CURATED_MIN_HEADINGS = 3
 
 
 class DatasetError(RuntimeError):
@@ -80,24 +89,67 @@ def meta_for(article: TrainingArticle) -> str:
     return text[:META_FALLBACK_CHARS].rsplit(" ", 1)[0] if len(text) > META_FALLBACK_CHARS else text
 
 
+def _fit_article_body(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    title: str,
+    meta: str,
+    body: str,
+) -> str:
+    """Keep one rendered example inside the trainer's context-size proxy.
+
+    The source article is the only part we shorten. We prefer a section
+    boundary so the model does not learn a sentence fragment, while retaining
+    the title, metadata, and prompt exactly as they are sent at inference.
+    """
+    assistant_prefix = f"TITLE: {title}\nMETA: {meta}\n---\n"
+    available = (
+        MAX_EXAMPLE_CHARS - len(system_prompt) - len(user_prompt) - len(assistant_prefix) - 1
+    )
+    body = body.strip()
+    if len(body) <= available:
+        return body
+
+    body_budget = max(1, available - len(TRUNCATION_MARKER))
+    first_heading = body.find("## ")
+    if first_heading > body_budget:
+        # Keep the first section heading when a long introduction would
+        # otherwise consume the entire budget.
+        shortened = body[first_heading : first_heading + body_budget].rstrip()
+    else:
+        boundary = body.rfind("\n## ", 0, body_budget)
+        # Keep at least the first heading. If the only heading is the last
+        # boundary found, cutting immediately before it would make the row
+        # fail the production parser's section check.
+        cut = boundary if boundary > first_heading else body_budget
+        shortened = body[:cut].rstrip()
+    return shortened + TRUNCATION_MARKER.rstrip()
+
+
 def to_example(article: TrainingArticle) -> dict[str, Any]:
     """Render one article into a chat-format training example."""
     params = params_for(article)
+    system_prompt = prompt_service.build_system_prompt(params)
+    user_prompt = prompt_service.build_user_prompt(params, [])
+    meta = meta_for(article)
+    body = _fit_article_body(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        title=article.title or "",
+        meta=meta,
+        body=article.clean_markdown or "",
+    )
     # No retrieved chunks: the corpus articles were not written against sources,
     # so training on a fabricated "Reference material" block would teach the
     # model to ignore the one we *do* send at inference time.
     return {
         "messages": [
-            {"role": "system", "content": prompt_service.build_system_prompt(params)},
-            {"role": "user", "content": prompt_service.build_user_prompt(params, [])},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
             {
                 "role": "assistant",
-                "content": (
-                    f"TITLE: {article.title}\n"
-                    f"META: {meta_for(article)}\n"
-                    f"---\n"
-                    f"{(article.clean_markdown or '').strip()}\n"
-                ),
+                "content": (f"TITLE: {article.title}\nMETA: {meta}\n---\n{body}\n"),
             },
         ],
         # Carried for traceability; the trainer reads `messages` only.
@@ -107,6 +159,35 @@ def to_example(article: TrainingArticle) -> dict[str, Any]:
 
 def eligible(articles: list[TrainingArticle]) -> list[TrainingArticle]:
     return [a for a in articles if a.labels and a.clean_markdown and a.title and not a.is_duplicate]
+
+
+def training_quality_issues(article: TrainingArticle) -> list[str]:
+    """Return contract violations for one assistant target.
+
+    This is deliberately separate from ``eligible``: v1 is immutable and was
+    built with the original permissive rules.  New versions can opt into the
+    stricter curation pass without changing old bytes or the held-out URLs.
+    """
+    if not article.labels or not article.clean_markdown or not article.title:
+        return ["missing required training fields"]
+
+    example = to_example(article)
+    title, meta, body = parse_article(example["messages"][2]["content"])
+    params = params_for(article)
+    issues: list[str] = []
+
+    if not quality.TITLE_MIN <= len(title.strip()) <= quality.TITLE_MAX:
+        issues.append("title length")
+    if not META_MIN_CHARS <= len(meta.strip()) <= META_MAX_CHARS:
+        issues.append("meta length")
+    if quality.count_h2(body) < CURATED_MIN_HEADINGS:
+        issues.append("fewer than 3 H2 sections")
+    floor = int(params.target_words * (1 - quality.WORD_COUNT_TOLERANCE))
+    if quality.count_words(body) < floor:
+        issues.append(f"body below {floor} words")
+    if quality.keyword_coverage(body, params.keywords) < quality.MIN_KEYWORD_COVERAGE:
+        issues.append("low keyword coverage")
+    return issues
 
 
 def validate_rows(splits: dict[Split, list[dict[str, Any]]]) -> list[str]:
@@ -157,17 +238,32 @@ async def run_build(
     eval_frac: float = 0.1,
     seed: int = 13,
     overwrite: bool = False,
+    quality_filter: bool = False,
 ) -> dict[str, Any]:
-    articles = eligible(await store.usable())
-    if not articles:
+    candidates = eligible(await store.usable())
+    if not candidates:
         raise DatasetError("no labelled articles — run scrape -> clean -> label first")
 
     splits: dict[Split, list[dict[str, Any]]] = {"train": [], "eval": []}
     assignment: dict[str, Split] = {}
-    for article in articles:
+    excluded: dict[str, int] = {}
+    excluded_rows = 0
+    articles: list[TrainingArticle] = []
+    for article in candidates:
         split = split_for(article.url, eval_frac, seed)
+        # Keep every held-out URL so the v2 benchmark remains comparable to v1.
+        issues = training_quality_issues(article) if quality_filter and split == "train" else []
+        if issues:
+            excluded_rows += 1
+            for issue in issues:
+                excluded[issue] = excluded.get(issue, 0) + 1
+            continue
         splits[split].append(to_example(article))
+        articles.append(article)
         assignment[article.url] = split
+
+    if not splits["train"]:
+        raise DatasetError("quality filter removed every training example")
 
     if problems := validate_rows(splits):
         raise DatasetError(
@@ -181,6 +277,10 @@ async def run_build(
         "train": len(splits["train"]),
         "eval": len(splits["eval"]),
         "fingerprint": digest[:12],
+        "quality_filter": quality_filter,
+        "candidates": len(candidates),
+        "excluded": excluded_rows,
+        "excluded_reasons": excluded,
     }
 
     existing = await store.dataset_version(version)
@@ -233,6 +333,10 @@ def run(
     eval_frac: float = typer.Option(0.1, help="Fraction held out for evaluation."),
     seed: int = 13,
     overwrite: bool = typer.Option(False, help="Replace an existing version (only if untrained)."),
+    quality_filter: bool = typer.Option(
+        False,
+        help="Curate training rows against the production output contract; eval URLs stay fixed.",
+    ),
 ) -> None:
     """Build, validate and publish `datasets/{version}/` to R2 — only if it changed."""
 
@@ -248,6 +352,7 @@ def run(
                             eval_frac=eval_frac,
                             seed=seed,
                             overwrite=overwrite,
+                            quality_filter=quality_filter,
                         )
                     )
             except DatasetError as exc:
@@ -385,8 +490,8 @@ live in Postgres (`training_articles`), with every run logged in `pipeline_runs`
 
 No personal data. Author bylines and dates are stripped so the model cannot
 attribute text to a real person. The house call-to-action and reference lists
-are removed so the model neither advertises nor fabricates citations. Only the
-LoRA adapter is published, never the corpus.
+are removed so the model neither advertises nor fabricates citations. Neither
+the corpus nor the LoRA adapter is published.
 """
 
 

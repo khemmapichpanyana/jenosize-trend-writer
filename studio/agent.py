@@ -48,11 +48,19 @@ SYSTEM_PROMPT = """You are the Jenosize Ideas content agent. You help the team p
 design and refine business trend articles.
 
 How you work:
+- When a brief needs current data, statistics, named examples or facts you
+  are not already confident about, call `web_search` first — you may call it
+  several times with different angles in the same turn to research in
+  parallel. Ground the article in what you find (pass the best source's URL
+  as write_article's source_url, or cite sources in your reply); never invent
+  statistics or sources.
 - Article text is written by Jenosize's fine-tuned writer model. ALWAYS call
   `write_article` to draft or rewrite an article; never write the article body
   yourself. Pass an `artifact_id` to revise an existing artifact.
 - To turn an article into a branded web page, call `design_page`. Call
   `list_images` first when the user mentions images, and pass their ids.
+- When the user asks for a visual and no suitable upload exists, call
+  `generate_image`, then pass its returned asset id to `design_page`.
 - Ask one short clarifying question only when the topic is genuinely unclear;
   otherwise pick sensible defaults (medium length, business-leader audience).
 - After a tool finishes, reply in 1-3 sentences: what you made and what the
@@ -62,8 +70,9 @@ How you work:
 Brand context:
 """
 
-MAX_MODEL_CALLS = 12
-MAX_TOOL_CALLS = 8
+MAX_MODEL_CALLS = 14
+# A research pass (several parallel web_search calls) plus write/design still fits.
+MAX_TOOL_CALLS = 12
 TITLE_CHARS = 60
 
 
@@ -137,7 +146,7 @@ async def run_turn(
         return
     if save_user_message:
         await store.add_message(thread_id, "user", user_text, asset_ids=asset_ids)
-    if thread["title"] == "New chat":
+    if _is_placeholder_title(thread["title"]):
         await store.touch_thread(
             thread_id, title=user_text.strip().splitlines()[0][:TITLE_CHARS] or "New chat"
         )
@@ -230,6 +239,12 @@ async def run_turn(
         "model": saved["model"],
     }
     yield {"type": "done"}
+
+
+def _is_placeholder_title(title: str) -> bool:
+    """Titles the console gives a thread before its first message; the first
+    user brief replaces them. Includes older console defaults still in the DB."""
+    return title in ("New chat", "Jenosize demo workspace") or title.startswith("New article — ")
 
 
 def _parse(result: str) -> Any:

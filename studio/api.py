@@ -24,6 +24,7 @@ import psycopg
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings
@@ -54,11 +55,22 @@ HEARTBEAT_S = 15.0
 
 
 @asynccontextmanager
-async def studio_store(settings: Settings) -> AsyncIterator[StudioStore]:
+async def studio_store(
+    settings: Settings,
+    pool: AsyncConnectionPool[psycopg.AsyncConnection[dict[str, Any]]] | None = None,
+) -> AsyncIterator[StudioStore]:
+    """Borrow a connection from `pool` when one is available (the HTTP server's
+    request paths — see the lifespan in pipeline/api/app.py), else open a fresh
+    one. The fresh-connect fallback keeps working for contexts with no pool,
+    e.g. the background agent_worker, which isn't a per-request hot path."""
     if not settings.database_url:
         raise AppError(
             "Database is not configured (DB_URL)", code="not_configured", status_code=503
         )
+    if pool is not None:
+        async with pool.connection() as conn:
+            yield StudioStore(conn)
+        return
     conn = await psycopg.AsyncConnection.connect(
         settings.database_url, autocommit=True, row_factory=dict_row, prepare_threshold=None
     )
@@ -68,8 +80,16 @@ async def studio_store(settings: Settings) -> AsyncIterator[StudioStore]:
         await conn.close()
 
 
+def _pool(request: Request) -> AsyncConnectionPool[psycopg.AsyncConnection[dict[str, Any]]] | None:
+    """`None` when the app's lifespan never set one up — e.g. the local
+    combined dev server (`scripts/dev_server.py --with-jobs`), which mounts
+    this app as a sub-app and FastAPI doesn't propagate lifespan to those.
+    `studio_store` falls back to a fresh per-request connection in that case."""
+    return getattr(request.app.state, "db_pool", None)
+
+
 async def _store(request: Request) -> AsyncIterator[StudioStore]:
-    async with studio_store(request.app.state.settings) as store:
+    async with studio_store(request.app.state.settings, _pool(request)) as store:
         yield store
 
 
@@ -102,13 +122,35 @@ class NewThread(BaseModel):
 
 
 class ChatTurn(BaseModel):
-    content: str = Field(min_length=1, max_length=8000)
+    content: str = Field(min_length=1, max_length=8777)
     asset_ids: list[UUID] = Field(default_factory=list, max_length=10)
 
 
 class PublishRequest(BaseModel):
     version: int | None = Field(None, ge=1, description="Default: the current version.")
     slug: str | None = Field(None, pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$", max_length=SLUG_MAX)
+
+
+@router.post("/warmup")
+async def warmup(request: Request, settings: SettingsDep) -> dict[str, Any]:
+    """Wake the shared writer/agent model when a user opens the studio.
+
+    This is intentionally best-effort from the console: a cold-start failure
+    must not prevent a user from opening a thread, while the provider's bounded
+    retries make a successful warmup likely before the first message is sent.
+    """
+    if settings.model_provider == "mock":
+        return {"status": "skipped", "detail": "MODEL_PROVIDER=mock"}
+    started = time.perf_counter()
+    try:
+        await build_provider(settings).warmup()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "detail": str(exc)[:300],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+    return {"status": "ok", "latency_ms": int((time.perf_counter() - started) * 1000)}
 
 
 # ------------------------------------------------------------------ threads
@@ -259,14 +301,14 @@ async def run_events(
     saw gets exactly the events it missed. Polls every 0.4 s (tokens are
     coalesced by the worker, so this is a handful of rows per poll).
     """
-    async with studio_store(settings) as store:
+    async with studio_store(settings, _pool(request)) as store:
         if await store.get_run(run_id) is None:
             raise NotFoundError(f"no agent run {run_id}")
 
     async def stream() -> AsyncIterator[str]:
         last, beat = after_id, time.monotonic()
         # Own connection for the life of the stream (see runs.run_events).
-        async with studio_store(settings) as store:
+        async with studio_store(settings, _pool(request)) as store:
             while True:
                 rows = await store.events_after(run_id, last)
                 for row in rows:
@@ -388,6 +430,18 @@ async def asset_raw(asset_id: UUID, store: StoreDep, storage: StorageDep) -> Res
 # ------------------------------------------------------------------ artifacts
 
 
+@router.get("/generated")
+async def list_generated(
+    store: StoreDep,
+    q: str | None = Query(None, min_length=1, max_length=200),
+    status: str | None = Query(None, pattern="^(draft|published)$"),
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    total, items = await store.list_generated(query=q, status=status, limit=limit, offset=offset)
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
 @router.get("/artifacts/{artifact_id}")
 async def get_artifact(artifact_id: UUID, store: StoreDep) -> dict[str, Any]:
     artifact = await store.get_artifact(artifact_id)
@@ -490,10 +544,22 @@ async def publish_artifact(
 
 @router.get("/content")
 async def list_content(
-    store: StoreDep, request: Request, settings: SettingsDep
-) -> list[dict[str, Any]]:
+    store: StoreDep,
+    request: Request,
+    settings: SettingsDep,
+    q: str | None = Query(None, min_length=1, max_length=200),
+    status: str | None = Query(None, pattern="^(published|unpublished)$"),
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
     base = _share_base(settings, request)
-    return [{**row, "url": f"{base}/p/{row['slug']}"} for row in await store.list_published()]
+    total, rows = await store.list_published(query=q, status=status, limit=limit, offset=offset)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [{**row, "url": f"{base}/p/{row['slug']}"} for row in rows],
+    }
 
 
 @router.post("/content/{slug}/unpublish")
@@ -512,7 +578,7 @@ async def public_asset(asset_id: UUID, request: Request) -> Response:
     """An image, only while a published page references it."""
     settings: Settings = request.app.state.settings
     storage: Storage = request.app.state.storage_factory()
-    async with studio_store(settings) as store:
+    async with studio_store(settings, _pool(request)) as store:
         asset = await store.get_asset(asset_id)
         if asset is None or not await store.is_asset_public(asset_id):
             raise NotFoundError("not found")
@@ -527,7 +593,7 @@ async def public_asset(asset_id: UUID, request: Request) -> Response:
 async def public_page(slug: str, request: Request) -> HTMLResponse:
     settings: Settings = request.app.state.settings
     storage: Storage = request.app.state.storage_factory()
-    async with studio_store(settings) as store:
+    async with studio_store(settings, _pool(request)) as store:
         row = await store.get_published(slug)
     if row is None:
         raise NotFoundError("not found")

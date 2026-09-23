@@ -22,17 +22,20 @@ from common import (
     MINUTES,
     VOLUMES,
     app,
-    hf_secret,
     serve_image,
     vllm_secret,
 )
 
-VLLM_PORT = 8000
+VLLM_PORT = 8777
 
 
 # 8192 covers the longest brief (retrieved chunks) plus a 1500-word article with
 # room to spare; raising it costs KV-cache memory on a 24 GB L4.
-MAX_MODEL_LEN = 8192
+# 8192 is useful for long retrieval contexts, but it also increases the number
+# of CUDA-graph shapes compiled during a cold start. Override this for a
+# throughput-focused deployment; the serverless demo defaults to eager mode
+# below so the first request is not blocked by graph compilation.
+MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
 MAX_LORA_RANK = 64  # must be >= the largest lora_r TrainParams accepts
 
 
@@ -40,7 +43,7 @@ MAX_LORA_RANK = 64  # must be >= the largest lora_r TrainParams accepts
     image=serve_image,
     gpu="L4",
     volumes=VOLUMES,
-    secrets=[hf_secret, vllm_secret],
+    secrets=[vllm_secret],
     port=VLLM_PORT,
     # The API key is checked by vLLM itself, so Modal's proxy must let the
     # request through to it.
@@ -71,6 +74,14 @@ class VLLMServer:
             "--tool-call-parser",
             "hermes",
         ]
+
+        # vLLM's default CUDA-graph compilation is excellent for a warm,
+        # continuously running GPU, but the compile phase is repeated after a
+        # scale-to-zero cold start. Eager execution removes that ~minute-long
+        # startup tax. Set VLLM_ENFORCE_EAGER=0 when warm throughput matters
+        # more than serverless first-request latency.
+        if os.environ.get("VLLM_ENFORCE_EAGER", "1").lower() not in {"0", "false", "no"}:
+            cmd.append("--enforce-eager")
 
         # Every complete adapter on the volume is registered under its own name
         # (jeno-lora-v1, jeno-lora-v2, ...), plus `jeno-lora` for the active one

@@ -303,12 +303,23 @@ class CorpusStore:
     # ----------------------------------------------------------- browsing
 
     async def list_articles(
-        self, *, state: str = "all", category: str | None = None, limit: int = 50, offset: int = 0
+        self,
+        *,
+        state: str = "all",
+        category: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> tuple[int, list[TrainingArticle]]:
         """Page through the corpus by pipeline state (the predicate is a fixed map)."""
         where = ARTICLE_STATES[state]
-        params = {"category": category, "limit": limit, "offset": offset}
-        filters = f"({where}) and (%(category)s::text is null or category_slug = %(category)s)"
+        params = {"category": category, "query": query, "limit": limit, "offset": offset}
+        filters = (
+            f"({where}) and (%(category)s::text is null or category_slug = %(category)s)"
+            " and (%(query)s::text is null or title ilike concat('%%', %(query)s::text, '%%')"
+            " or url ilike concat('%%', %(query)s::text, '%%')"
+            " or category_slug ilike concat('%%', %(query)s::text, '%%'))"
+        )
         async with self._conn.cursor() as cur:
             await cur.execute(
                 f"select count(*) as n from training_articles where {filters}", params

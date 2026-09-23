@@ -9,7 +9,7 @@ linked to the job. The job's lifecycle lives in `job_runs`:
 The executors here are plain async functions with their dependencies passed in,
 so the same code runs inside a Modal worker in production and in-process in
 tests and local development. Work that needs Modal resources (train and eval
-on GPUs, publish from the model volume) goes through `RemoteRunner`, which in
+on GPUs) goes through `RemoteRunner`, which in
 production calls the Modal functions and in tests is a fake.
 """
 
@@ -33,7 +33,7 @@ from pipeline.store import CorpusStore, connect_jobs
 
 logger = get_logger(__name__)
 
-JobKind = Literal["scrape", "label", "train", "eval", "publish"]
+JobKind = Literal["scrape", "label", "train", "eval"]
 RemoteRunner = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 # Dataset/adapter versions look like v1, v2, … — keeps R2 keys and Modal volume
@@ -66,7 +66,6 @@ class TrainParams(BaseModel):
     epochs: int = Field(3, ge=1, le=10)
     lora_r: Literal[8, 16, 32, 64] = 16
     learning_rate: float = Field(2e-4, gt=0, le=1e-3)
-    push_to_hub: bool = False
 
 
 class EvalParams(BaseModel):
@@ -83,22 +82,11 @@ class EvalParams(BaseModel):
     limit: int = Field(20, ge=1, le=200)
 
 
-class PublishParams(BaseModel):
-    """Upload a trained adapter to the Hugging Face Hub."""
-
-    version: str = Field(pattern=VERSION_PATTERN)
-    repo_id: str = Field(
-        pattern=r"^[A-Za-z0-9][\w.-]*/[\w.-]+$", description="e.g. your-user/jeno-trend-writer-lora"
-    )
-    private: bool = False
-
-
 PARAMS: dict[str, type[BaseModel]] = {
     "scrape": ScrapeParams,
     "label": LabelParams,
     "train": TrainParams,
     "eval": EvalParams,
-    "publish": PublishParams,
 }
 
 
@@ -155,7 +143,7 @@ async def execute(
             stats.update(result_stats, model=model)
         return dict(stats)
 
-    if kind in ("train", "eval", "publish"):
+    if kind in ("train", "eval"):
         if remote_runner is None:
             raise RuntimeError(f"{kind} jobs run on Modal; no remote runner is configured here")
         if kind == "train":
@@ -167,17 +155,10 @@ async def execute(
                     "epochs": p_train.epochs,
                     "lora_r": p_train.lora_r,
                     "learning_rate": p_train.learning_rate,
-                    "push_to_hub": p_train.push_to_hub,
                     "adapter_dir": adapter_dir(p_train.version),
                     # lets the GPU job write live progress rows for this run
                     "job_id": str(job_id) if job_id else None,
                 },
-            )
-        if kind == "publish":
-            p_pub = PublishParams.model_validate(params)
-            return await remote_runner(
-                "publish",
-                {"version": p_pub.version, "repo_id": p_pub.repo_id, "private": p_pub.private},
             )
         p_eval = EvalParams.model_validate(params)
         output = await remote_runner(

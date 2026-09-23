@@ -1,7 +1,6 @@
 """LoRA fine-tune of Qwen3-4B on the Jenosize corpus (Unsloth + TRL).
 
     modal run modal/train.py --dataset-uri r2://datasets/v1/train.jsonl
-    modal run modal/train.py --dataset-uri /models/datasets/v1/train.jsonl --push-to-hub
 
 Why LoRA rather than a full fine-tune: the goal is *style*, not new knowledge.
 A rank-16 adapter on a 4B base converges in minutes on one L4, costs a couple of
@@ -17,14 +16,12 @@ a style adapter.
 from __future__ import annotations
 
 import json
-import os
 
 from common import (
     BASE_MODEL,
     MINUTES,
     VOLUMES,
     app,
-    hf_secret,
     models_volume,
     pipeline_secret,
     r2_client,
@@ -64,7 +61,6 @@ TARGET_MODULES = [
 INSTRUCTION_PART = "<|im_start|>user\n"
 RESPONSE_PART = "<|im_start|>assistant\n"
 
-HF_REPO = os.environ.get("JENO_HF_REPO", "jenosize/jeno-trend-writer-lora")
 CHECKPOINT_DIR = "/models/checkpoints"
 
 
@@ -85,12 +81,11 @@ def _load_jsonl(uri: str) -> list[dict]:
     gpu="L4",
     volumes=VOLUMES,
     # jeno-pipeline: the database, for live progress rows
-    secrets=[hf_secret, r2_secret, pipeline_secret],
+    secrets=[r2_secret, pipeline_secret],
     timeout=180 * MINUTES,
 )
 def train(
     dataset_uri: str = "r2://datasets/v1/train.jsonl",
-    push_to_hub: bool = False,
     epochs: int = EPOCHS,
     lora_r: int = LORA_R,
     learning_rate: float = LEARNING_RATE,
@@ -150,7 +145,6 @@ def train(
         max_seq_length=MAX_SEQ_LEN,
         load_in_4bit=True,
         dtype=None,  # let Unsloth pick bf16 on Ada/Ampere
-        token=os.environ.get("HF_TOKEN"),
     )
 
     model = FastLanguageModel.get_peft_model(
@@ -235,49 +229,13 @@ def train(
     progress.close()
     print(f"[jeno] adapter written to {adapter_dir} and committed to the volume")
 
-    if push_to_hub:
-        from huggingface_hub import HfApi
-
-        api = HfApi(token=os.environ["HF_TOKEN"])
-        api.create_repo(HF_REPO, repo_type="model", exist_ok=True)
-        api.upload_folder(folder_path=adapter_dir, repo_id=HF_REPO, repo_type="model")
-        print(f"[jeno] pushed to https://huggingface.co/{HF_REPO}")
-
     return metrics
-
-
-@app.function(image=train_image, volumes=VOLUMES, secrets=[hf_secret], timeout=30 * MINUTES)
-def publish(version: str, repo_id: str, private: bool = False) -> dict:
-    """Upload /models/jeno-lora-{version} to the Hugging Face Hub.
-
-    Separate from training so an adapter is published only after it has been
-    evaluated, not as a side effect of every run.
-    """
-    from huggingface_hub import HfApi
-
-    folder = f"/models/jeno-lora-{version}"
-    if not os.path.isfile(f"{folder}/adapter_config.json"):
-        raise FileNotFoundError(f"no complete adapter at {folder}")
-    api = HfApi(token=os.environ["HF_TOKEN"])
-    api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
-    commit = api.upload_folder(
-        folder_path=folder,
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message=f"jeno-lora {version}",
-    )
-    return {
-        "repo_id": repo_id,
-        "url": f"https://huggingface.co/{repo_id}",
-        "commit": str(commit.oid),
-    }
 
 
 @app.local_entrypoint()
 def train_main(
     version: str = "v1",
     dataset_uri: str | None = None,
-    push_to_hub: bool = False,
     epochs: int = EPOCHS,
     lora_r: int = LORA_R,
     learning_rate: float = LEARNING_RATE,
@@ -290,7 +248,6 @@ def train_main(
     """
     metrics = train.remote(
         dataset_uri=dataset_uri or f"r2://datasets/{version}/train.jsonl",
-        push_to_hub=push_to_hub,
         epochs=epochs,
         lora_r=lora_r,
         learning_rate=learning_rate,

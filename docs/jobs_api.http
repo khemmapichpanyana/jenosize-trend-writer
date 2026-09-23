@@ -52,7 +52,7 @@ Content-Type: application/json
 GET {{jobs}}/v1/runs/{{run}}
 X-API-Key: {{key}}
 
-### Recent runs (filter with ?kind=scrape|label|train|eval|publish)
+### Recent runs (filter with ?kind=scrape|label|train|eval)
 GET {{jobs}}/v1/runs?limit=10
 X-API-Key: {{key}}
 
@@ -170,12 +170,3 @@ X-API-Key: {{key}}
 Content-Type: application/json
 
 {"version": "v1", "endpoint": "{{vllm}}/v1", "judge": true}
-
-### ─────────────────────────── 7. Publish ───────────────────────────
-
-### Upload the evaluated adapter to Hugging Face
-POST {{jobs}}/v1/adapters/v1/publish
-X-API-Key: {{key}}
-Content-Type: application/json
-
-{"version": "v1", "repo_id": "<your-hf-user>/jeno-trend-writer-lora"}

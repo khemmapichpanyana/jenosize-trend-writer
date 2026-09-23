@@ -12,7 +12,6 @@ User / client ──► Vercel: FastAPI backend (trend-writer.workser.app)
                                 (Qwen3-4B-Instruct-2507 + LoRA adapter)
                                 ▲
 Modal: train.py (Unsloth LoRA) ─┘ writes the adapter to a Modal Volume
-                                  (+ pushes to Hugging Face Hub)
 
 Cloudflare DNS: trend-writer.workser.app → CNAME → Vercel (DNS only, not proxied)
 ```
@@ -28,7 +27,6 @@ deployment yet — this repo is the Python service.
 | **Modal** | All GPU work: `train.py` (fine-tune), `serve.py` (vLLM + LoRA, scale to zero), `eval.py`. | Business logic, request validation. |
 | **Supabase** | Postgres records. RLS on, no policies, service key only. | User auth — the product has none. |
 | **Cloudflare R2** | Raw scraped HTML, uploads, datasets, generated markdown, eval output. | Public reads; the bucket is private. |
-| **Hugging Face Hub** | Public LoRA adapter + model card. | Serving. |
 
 ## Core design principle
 

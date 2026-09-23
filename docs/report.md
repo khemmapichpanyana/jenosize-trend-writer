@@ -1,86 +1,82 @@
-# Jenosize Trend Writer — Technical Report
+# Jenosize Trend Writer — assignment report
 
-> **Status: outline.** Sections marked _(Day 1)_ / _(Day 2)_ are filled in as the
-> data pipeline and fine-tuning land. Written against the grading split:
-> fine-tuning 40%, data engineering 20%, deployment 20%, documentation 20%.
+**Option 1: Trend & Future Ideas Articles · 22 September 2026**
 
----
+## Approach
 
-## 1. Problem statement
+The prototype accepts a business topic, category, industry, audience, SEO
+keywords, target length, and optional URL or document. A FastAPI service
+normalizes the brief, retrieves relevant passages from any supplied source,
+prompts a fine-tuned writer, checks the output, and returns an article. A
+separate LangChain Studio agent calls that same writer through a tool, then
+offers a preview and explicit publishing action in a Next.js app. The agent
+never substitutes its own prose for the writer's article.
 
-- What the service produces: business trend / future-ideas articles in the
-  Jenosize Ideas voice.
-- Inputs: topic, category, industry, target audience, SEO keywords, optional
-  source URL or uploaded document.
-- What "good" means here: on-voice, structured, SEO-complete, factually
-  restrained.
+I selected **Qwen3-4B-Instruct-2507** because a 4B instruction model is small
+enough to serve on one Modal GPU while retaining useful English business-writing
+ability. LoRA rank 16 adapts style without retraining all weights. The deployed
+alias `jeno-lora` points to the active `jeno-lora-v2` adapter; the base model is
+also served for comparison. Retrieval is kept outside the weights: a small
+brand corpus should teach tone, not be trusted as a source of current facts.
 
-## 2. Approach
+## Data engineering and training
 
-- **Core thesis: fine-tuning teaches style, retrieval supplies facts.**
-- Why a 4B base + LoRA rather than prompting a frontier model: cost per article,
-  latency, and the fact that the deliverable is a *fine-tune*.
-- Why retrieval is separate: a small model that invents statistics is worse than
-  no model; grounding is a data problem, not a weights problem.
-- What is deliberately *not* done: no RLHF, no agent loop, no vector DB.
+The pipeline discovered 174 Jenosize Ideas URLs, fetched 170, cleaned 159,
+and reverse-labelled 159 articles into briefs. It strips navigation, CTAs,
+bylines, and reference sections; normalizes headings; filters length and
+near-duplicates; and validates title, meta description, and section structure.
+The v2 quality filter excluded 54 candidates and published **92 train / 13
+held-out** examples. Splitting is deterministic by source-URL hash; dataset
+fingerprint is `69f0b4147fd8`. The JSONL contains system, user brief, and
+assistant article turns, using the same prompt builder as inference. The
+dataset and a detailed data card are included in the private submission bundle.
 
-## 3. Data engineering _(Day 1)_
+The active v2 adapter trained for **one epoch, 12 optimizer steps**, with LoRA
+rank 16 and learning rate `1e-4`; recorded final train loss was **2.2831**.
+Loss is not directly comparable to v1 because the corpus, quality filter,
+epoch count, and learning rate changed. The training and serving code, not a
+hosted third-party fine-tune, loads this adapter in vLLM.
 
-- Corpus: source, size, collection method, dedupe strategy.
-- Cleaning rules and what each one prevents the model from learning.
-- **Reverse-labelling**: inferring the brief from the finished article, and the
-  two rules that keep labels honest (labeller sees only the article; every
-  inferred industry is normalised with the shipped `normalize_industry`).
-- Prompt-parity invariant: the dataset is rendered through the same
-  `app/services/prompt.py` functions the API calls at inference.
-- Split strategy and leakage checks.
-- → see `docs/data_card.md`.
+## Evaluation and observed product flow
 
-## 4. Fine-tuning _(Day 2)_
+On 13 held-out briefs, the live v2 evaluation reported:
 
-- Base model: `Qwen/Qwen3-4B-Instruct-2507`. Why this one (size, licence,
-  instruction quality, Thai coverage).
-- Method: Unsloth LoRA, r=16, alpha=16, lr 2e-4, 3 epochs, max_seq_len 4096,
-  4-bit base.
-- Loss masking on the assistant turn only, and why it matters.
-- Hardware, wall-clock and cost per run (L4 on Modal).
-- Hyperparameter choices and what was tried.
-- Failure modes observed and how they were diagnosed.
+| Measure | Base | Fine-tuned v2 |
+|---|---:|---:|
+| Deterministic quality-gate pass rate | 69.2% (9/13) | **76.9% (10/13)** |
+| Mean SEO keyword coverage | **95.8%** | 92.1% |
+| Mean article words | 705 | 744 |
+| Mean H2 sections | 4.38 | 4.92 |
 
-## 5. Evaluation _(Day 2)_
+The independent blind judge recorded **3 fine-tuned wins and 2 base wins**,
+but only five parseable comparisons are present, so this is not a 13-pair
+style result. The one-brief quality-gate edge is likewise too small to claim
+general superiority. v1 performed materially worse than base; v2 is a better
+demo checkpoint, not proof that fine-tuning universally improves quality.
 
-- Deterministic metrics (`app/services/quality.py`): word count, `##` count,
-  keyword coverage, title length — cheap, reproducible, gate the API.
-- Pairwise LLM judge on style adherence: base vs fine-tuned, held-out briefs.
-- Memorisation check: n-gram overlap with the training corpus.
-- Results table + honest discussion of where the fine-tune does *not* help.
+The tested end-to-end path used a real local FastAPI/Next.js pair and the
+remote Modal vLLM: a user brief caused a `write_article` agent call, the
+`jeno-lora` writer produced a stored draft, and Studio rendered its preview.
+The draft appears in the searchable article library. FastAPI also exposes
+`POST /api/v1/articles` for direct topic-to-article generation and an SSE
+streaming variant. A warm vLLM reply takes seconds; a scale-to-zero cold start
+was observed at roughly 2–3 minutes, so page entry triggers best-effort warmup
+and generation retries transient 502/503/504 responses.
 
-## 6. Serving and deployment
+## Challenges, limitations, and next steps
 
-- FastAPI on Vercel (CPU) + vLLM on Modal (GPU), and why the split is forced by
-  Vercel's 500 MB Python bundle limit.
-- Scale-to-zero economics; cold starts; `POST /model/warmup`; SSE heartbeats.
-- Pluggable seams (model / persistence / storage) and the zero-account local
-  mode that makes the service reproducible by a grader.
-- Error model, structured logging, request ids.
-- → see `docs/architecture.md`.
+The biggest engineering issue was Modal's cold GPU startup returning 503 before
+an upstream existed. Bounded readiness polling, retries, and UI progress make
+this recoverable, but cannot remove cold-start latency without a paid warm
+container. Another issue was a local dashboard querying its own empty model
+volume while the deployed adapter lived on Modal; the UI now says that the
+registry is local rather than claiming no adapter exists.
 
-## 7. Results
-
-- Public endpoint and demo instructions.
-- Latency profile: cold vs warm, blocking vs streaming.
-- Example generations, with the quality report shown alongside.
-
-## 8. Limitations and next steps
-
-- Single-publisher corpus; inferred labels; English-dominant.
-- Retrieval is BM25 over per-request documents, not a persistent index.
-- No background job queue: generation happens inside the request.
-- Next: larger corpus, embedding retrieval over a persistent index, Thai
-  evaluation set, human review loop on quality-gate failures.
-
-## 9. Appendix
-
-- Repository layout.
-- Environment variables.
-- Reproduction steps (train → eval → deploy).
+The dataset is small, English-only, single-publisher, and its briefs are
+inferred from finished articles. Source-grounded examples were not in the
+fine-tuning set. Generated claims still require editorial fact-checking, and
+the prototype is browser-scoped rather than production multi-tenant. Next
+steps are human review of more held-out topics (especially Thai), a complete
+13-pair style adjudication, evidence/citation checks, and a persistent warm
+serving tier only if usage justifies its cost. The submission requires a public
+prototype URL; that deployment is separate from the verified local flow.

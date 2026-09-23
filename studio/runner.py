@@ -100,6 +100,8 @@ async def execute_agent_run(
                 store=store,
                 generation=writer_factory(settings, storage),
                 designer=designer,  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
             )
         )
         agent = build_agent(models.primary, models.fallbacks, tools)

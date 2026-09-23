@@ -361,6 +361,13 @@ async def test_preview_publish_share_and_unpublish(
     async with make_client(studio_settings, r2, script) as client:
         events = await chat(client, thread_id, "Write and design it", [image_id])
         artifact_id = next(p for n, p in events if n == "artifact")["artifact_id"]
+        drafts = (await client.get("/v1/studio/generated", headers=KEY)).json()
+        assert drafts["total"] == 1
+        assert drafts["items"][0]["id"] == artifact_id
+        assert drafts["items"][0]["status"] == "draft"
+        assert (await client.get("/v1/studio/generated?status=published", headers=KEY)).json()[
+            "total"
+        ] == 0
 
         preview = await client.get(
             f"/v1/studio/artifacts/{artifact_id}/preview",
@@ -388,6 +395,11 @@ async def test_preview_publish_share_and_unpublish(
         ).json()
         assert published["url"] == f"https://share.example/p/{published['slug']}"
         assert published["version"] == 2 and published["asset_ids"] == [image_id]
+        published_list = (
+            await client.get("/v1/studio/generated?status=published", headers=KEY)
+        ).json()
+        assert published_list["total"] == 1
+        assert published_list["items"][0]["slug"] == published["slug"]
 
         page_response = await client.get(f"/p/{published['slug']}")
         assert page_response.status_code == 200
@@ -406,6 +418,9 @@ async def test_preview_publish_share_and_unpublish(
         assert [c["slug"] for c in listed] == [published["slug"]]
 
         await client.post(f"/v1/studio/content/{published['slug']}/unpublish", headers=KEY)
+        assert (await client.get("/v1/studio/generated?status=draft", headers=KEY)).json()[
+            "total"
+        ] == 1
         assert (await client.get(f"/p/{published['slug']}")).status_code == 410
         assert (await client.get(f"/p/assets/{image_id}")).status_code == 404
 

@@ -8,19 +8,22 @@ install:  ## Create the venv: runtime + dev + pipeline + Modal CLI
 	$(UV) sync --group dev --group pipeline --group modal --group agent
 
 dev:  ## Run the API locally with autoreload (mock provider, no cloud needed)
-	$(UV) run uvicorn app.main:app --reload --port 8000
+	$(UV) run python scripts/dev_server.py
+
+dev-assignment:  ## Run article + local Jobs APIs in one process
+	$(UV) run python scripts/dev_server.py --with-jobs
 
 test:  ## Run the test suite
 	$(UV) run pytest
 
 lint:  ## Lint + typecheck
-	$(UV) run ruff check .
-	$(UV) run ruff format --check .
+	$(UV) run ruff check app pipeline studio modal scripts tests
+	$(UV) run ruff format --check app pipeline studio modal scripts tests
 	$(UV) run mypy
 
 fmt:  ## Auto-format and auto-fix
-	$(UV) run ruff format .
-	$(UV) run ruff check --fix .
+	$(UV) run ruff format app pipeline studio modal scripts tests
+	$(UV) run ruff check --fix app pipeline studio modal scripts tests
 
 reqs:  ## Regenerate requirements.txt (what Vercel installs) from the runtime deps
 	./scripts/gen_requirements.sh
@@ -28,7 +31,7 @@ reqs:  ## Regenerate requirements.txt (what Vercel installs) from the runtime de
 smoke:  ## Smoke-test a running deployment: make smoke URL=https://...
 	./scripts/smoke_test.sh $(URL)
 
-.PHONY: help install dev test lint fmt reqs smoke
+.PHONY: help install dev dev-assignment test lint fmt reqs smoke
 
 # --- data pipeline: writes to Postgres (DATABASE_URL) + Cloudflare R2 ----------
 # Every target is incremental: re-running it only processes what changed.
@@ -70,7 +73,7 @@ modal-secrets:  ## Create/update the Modal secrets from .env (least privilege, v
 modal-doctor:  ## Check secrets, Postgres, R2 and imports from inside Modal (~1 cent)
 	$(UV) run modal run modal/doctor.py
 
-deploy-modal:  ## Deploy jobs API + vLLM server + train/eval/publish (one-time bootstrap)
+deploy-modal:  ## Deploy jobs API + vLLM server + train/eval (one-time bootstrap)
 	$(UV) run modal deploy modal/deploy.py
 
 jobs-dev:  ## Run the jobs API locally (scrape/label in-process; train/eval need Modal)

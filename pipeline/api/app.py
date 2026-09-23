@@ -14,10 +14,10 @@ After the one-time bootstrap (`modal setup`, `make modal-secrets`,
 | corpus | `POST /v1/scrape` · `GET /v1/corpus` · `/corpus/stats` · `/corpus/articles` · `/corpus/article?url=` · `/corpus/sample` |
 | labels | `POST /v1/label/preview` · `POST /v1/label` |
 | datasets | `POST /v1/datasets` · `GET /v1/datasets` · `/datasets/{v}/validate` · `/card` · `/examples` |
-| model | `POST /v1/train` · `POST /v1/eval` · `GET /v1/adapters` · `/adapters/{v}/activate` · `/adapters/{v}/publish` |
+| model | `POST /v1/train` · `POST /v1/eval` · `GET /v1/adapters` · `/adapters/{v}/activate` |
 | runs | `GET /v1/runs` · `GET /v1/runs/{id}` · `/runs/{id}/events` (live SSE) · `/runs/{id}/progress` · `POST /v1/runs/{id}/cancel` |
 | compute | `GET /v1/resources` (Modal containers + live GPU telemetry) |
-| studio | `/v1/studio/threads` · `POST /threads/{id}/runs` (queue an agent turn) · `/runs/{id}/events` (resumable SSE) · `/runs/{id}/cancel` · `/assets` · `/artifacts` · `/content` |
+| studio | `/v1/studio/warmup` · `/threads` · `POST /threads/{id}/runs` (queue an agent turn) · `/runs/{id}/events` (resumable SSE) · `/runs/{id}/cancel` · `/assets` · `/artifacts` · `/content` |
 | public | `GET /p/{slug}` · `GET /p/assets/{id}` — shared pages, no key |
 
 Every `/v1` route needs the `X-API-Key` header; `/p/*` is public by design.
@@ -53,10 +53,32 @@ def create_jobs_app(
     configure_logging(settings.log_level)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not settings.jobs_api_key:
             logger.warning("JOBS_API_KEY is not set; every /v1 request will be refused")
+        # A fresh psycopg connection pays ~700-900ms for TCP+TLS+auth to Supabase —
+        # a pool opened once here means requests borrow an already-open connection
+        # instead of paying that cost per request. See studio/api.py::studio_store.
+        app.state.db_pool = None
+        if settings.database_url:
+            import psycopg
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+
+            pool: AsyncConnectionPool[psycopg.AsyncConnection[dict[str, Any]]] = (
+                AsyncConnectionPool(
+                    settings.database_url,
+                    min_size=1,
+                    max_size=5,
+                    kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": None},
+                    open=False,
+                )
+            )
+            await pool.open()
+            app.state.db_pool = pool
         yield
+        if app.state.db_pool is not None:
+            await app.state.db_pool.close()
 
     app = FastAPI(
         title="Jenosize Trend Writer — Jobs API",
@@ -117,7 +139,7 @@ def create_local_app() -> FastAPI:
     """`make jobs-dev`: the jobs API on your machine, jobs running in-process.
 
     Scrape, label and datasets work against your real Postgres + R2; train,
-    eval and publish need Modal and fail with a clear message. Adapters are
+    and eval need Modal and fail with a clear message. Adapters are
     read from MODELS_DIR (default /models, usually absent locally).
     """
     from app.storage.r2 import R2Storage

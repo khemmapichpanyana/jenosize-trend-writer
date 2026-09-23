@@ -26,14 +26,14 @@ MODELS_VOLUME_NAME = "jeno-models"
 BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
 # Modal secrets (create with `modal secret create ...`):
-#   jeno-hf    -> HF_TOKEN        (pull the base model, push the adapter)
 #   jeno-vllm  -> VLLM_API_KEY    (bearer token the FastAPI backend sends)
 #   jeno-r2    -> R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 #                 R2_API_ENDPOINT, R2_JENOSIZE_BUCKET (same names as .env)
 #   jeno-pipeline -> SUPABASE_URL, DB_PASSWORD, DB_HOST (or DATABASE_URL),
-#                    JOBS_API_KEY, LABELER_* (the jobs API + workers)
+#                    JOBS_API_KEY, LABELER_*, and MODEL_*/AGENT_* runtime
+#                    settings (the jobs API + workers), including optional
+#                    OPENAI_API_KEY/IMAGE_* settings for Studio image generation
 # `make modal-secrets` creates both from .env, with only these keys.
-HF_SECRET_NAME = "jeno-hf"
 VLLM_SECRET_NAME = "jeno-vllm"
 R2_SECRET_NAME = "jeno-r2"
 PIPELINE_SECRET_NAME = "jeno-pipeline"
@@ -46,7 +46,6 @@ models_volume = modal.Volume.from_name(MODELS_VOLUME_NAME, create_if_missing=Tru
 # Separate cache volume so re-downloading 8 GB of base weights is a one-time cost.
 hf_cache_volume = modal.Volume.from_name("jeno-hf-cache", create_if_missing=True)
 
-hf_secret = modal.Secret.from_name(HF_SECRET_NAME)
 vllm_secret = modal.Secret.from_name(VLLM_SECRET_NAME)
 r2_secret = modal.Secret.from_name(R2_SECRET_NAME)
 pipeline_secret = modal.Secret.from_name(PIPELINE_SECRET_NAME)
@@ -130,7 +129,15 @@ serve_image = (
     modal.Image.debian_slim(python_version="3.12")
     # hf_transfer must be installed whenever HF_HUB_ENABLE_HF_TRANSFER=1, or
     # huggingface_hub refuses to download at all.
-    .uv_pip_install("vllm==0.11.0", "huggingface_hub>=0.26.0", "hf_transfer")
+    # vLLM 0.11.0 expects the pre-5.x Transformers tokenizer API. Without
+    # this pin, the resolver can select Transformers 5.x and vLLM crashes on
+    # Qwen2Tokenizer.all_special_tokens_extended during startup.
+    .uv_pip_install(
+        "vllm==0.11.0",
+        "transformers==4.57.1",
+        "huggingface_hub>=0.26.0",
+        "hf_transfer",
+    )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     # `pipeline.adapters` is stdlib-only; it decides which adapters to register.
     .add_local_python_source("common", "pipeline")
@@ -145,14 +152,21 @@ def _dependency_group(name: str) -> list[str]:
     """A [dependency-groups] list from pyproject.toml — one source of truth."""
     import tomllib
 
-    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
+    path = REPO_ROOT / "pyproject.toml"
+    # Modal imports this module again inside the already-built container to
+    # hydrate functions. pyproject.toml is a local image-build input and is not
+    # mounted there; the dependencies are already installed in app_image, so
+    # there is nothing to resolve during that second import.
+    if not path.is_file():
+        return []
+    with open(path, "rb") as fh:
         return list(tomllib.load(fh)["dependency-groups"][name])
 
 
 app_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install_from_requirements(str(REPO_ROOT / "requirements.txt"))
-    .uv_pip_install("psycopg[binary]>=3.2.0", *_dependency_group("agent"))
+    .uv_pip_install("psycopg[binary]>=3.2.0", "psycopg_pool>=3.2.0", *_dependency_group("agent"))
     .add_local_python_source("app", "pipeline", "studio", "common")
     # The agent's brand context + page theme (not .py, so added explicitly).
     .add_local_dir(str(REPO_ROOT / "studio" / "brand"), remote_path="/root/studio/brand")

@@ -37,9 +37,16 @@ def doctor() -> list[tuple[str, bool, str]]:
         "JOBS_API_KEY": settings.jobs_api_key,
         "R2 credentials": settings.r2_access_key_id and settings.r2_secret_access_key,
         "R2 endpoint (R2_API_ENDPOINT or R2_ACCOUNT_ID)": settings.r2_endpoint_url,
+        "MODEL_PROVIDER": settings.model_provider,
+        "MODEL_BASE_URL (or VLLM_BASE_URL)": settings.model_base_url,
+        "MODEL_NAME": settings.model_name,
     }
     for label, value in resolved.items():
-        checks.append((f"config {label}", bool(value), "set" if value else "missing"))
+        if label in {"MODEL_PROVIDER", "MODEL_BASE_URL (or VLLM_BASE_URL)", "MODEL_NAME"}:
+            detail = repr(value) if value else "missing"
+        else:
+            detail = "set" if value else "missing"
+        checks.append((f"config {label}", bool(value), detail))
     for var in ("LABELER_BASE_URL", "LABELER_MODEL"):
         present = bool(os.environ.get(var))
         checks.append(

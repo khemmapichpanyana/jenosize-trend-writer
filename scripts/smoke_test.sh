@@ -7,7 +7,7 @@
 # Exits non-zero on the first failure so it can gate a deploy in CI.
 set -euo pipefail
 
-BASE="${1:-http://localhost:8000}"
+BASE="${1:-http://localhost:8777}"
 API="${BASE%/}/api/v1"
 # `set -u` treats an empty array expansion as unbound on bash < 4.4 (macOS ships
 # 3.2), so the array always holds at least one harmless element.

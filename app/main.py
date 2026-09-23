@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "startup",
         extra={
             "env": settings.app_env,
+            "port": settings.port,
             "model_provider": settings.model_provider,
             "persistence": settings.persistence,
             "storage": settings.storage,

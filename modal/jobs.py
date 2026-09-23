@@ -12,14 +12,12 @@ in-process; this file only binds it to Modal.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import modal
 
-from common import MINUTES, app, app_image, models_volume, pipeline_secret, r2_secret
-from eval import evaluate
-from train import publish, train
+from common import APP_NAME, MINUTES, app, app_image, models_volume, pipeline_secret, r2_secret
 
 MODELS_DIR = "/models"
 
@@ -31,7 +29,7 @@ WORKER_TIMEOUT = 200 * MINUTES
 
 async def _run_remote(kind: str, params: dict[str, Any]) -> dict[str, Any]:
     """Run a Modal function and wait for it; those functions don't touch Postgres."""
-    fn = {"train": train, "eval": evaluate, "publish": publish}[kind]
+    fn = modal.Function.from_name(APP_NAME, {"train": "train", "eval": "evaluate"}[kind])
     return await fn.remote.aio(**params)
 
 
@@ -91,7 +89,11 @@ class ModalDispatcher:
         call = await job_worker.spawn.aio(str(job_id), kind, params)
         return call.object_id
 
-    async def poll(self, call_id: str) -> tuple[str, str | None]:
+    async def poll(
+        self, call_id: str
+    ) -> tuple[Literal["running", "finished", "error"], str | None]:
+        from builtins import TimeoutError as BuiltinTimeoutError
+
         from modal.exception import OutputExpiredError
         from modal.exception import TimeoutError as ModalTimeoutError
 
@@ -102,7 +104,10 @@ class ModalDispatcher:
         # (checked in the SDK), and it means "finished long ago", not "running".
         except OutputExpiredError:
             return "finished", "result expired"
-        except ModalTimeoutError:
+        # FunctionCall.get.aio(timeout=0) raises Python's built-in
+        # TimeoutError in some Modal SDK versions, while others raise Modal's
+        # wrapper. Both mean that the worker is still running here.
+        except (ModalTimeoutError, BuiltinTimeoutError):
             return "running", None
         except Exception as exc:  # the worker raised or was killed
             return "error", f"{type(exc).__name__}: {exc}"
@@ -128,9 +133,8 @@ class ModalDispatcher:
     async def function_stats(self) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
         for name, fn in (
-            ("train", train),
-            ("evaluate", evaluate),
-            ("publish", publish),
+            ("train", modal.Function.from_name(APP_NAME, "train")),
+            ("evaluate", modal.Function.from_name(APP_NAME, "evaluate")),
             ("job_worker", job_worker),
             ("agent_worker", agent_worker),
         ):
@@ -154,6 +158,9 @@ class ModalDispatcher:
     image=app_image,
     secrets=[r2_secret, pipeline_secret],
     volumes={MODELS_DIR: models_volume},  # list/activate adapters
+    # One warm CPU container (cheap, unlike the GPU vLLM server, which still
+    # scales to zero) so the console never pays a jobs-API cold start after idle.
+    min_containers=1,
 )
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app(label="jenosize-trend-writer-jobs-api")

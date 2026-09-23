@@ -108,6 +108,23 @@ def test_real_environment_applies_when_there_is_no_env_file(
     assert Settings(_env_file=None).r2_bucket == "from-deployment"  # type: ignore[call-arg]
 
 
+def test_port_comes_from_env_file_and_defaults_to_8777(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PORT", raising=False)
+    assert _settings(tmp_path, "PORT=8765\n").port == 8765
+    assert _settings(tmp_path).port == 8777
+
+
 def test_fields_can_still_be_set_by_name_in_code() -> None:
     s = Settings(_env_file=None, r2_bucket="x", r2_endpoint="https://y.example")  # type: ignore[call-arg]
     assert s.r2_bucket == "x" and s.r2_endpoint_url == "https://y.example"
+
+
+def test_vllm_aliases_configure_the_remote_provider(tmp_path: Path) -> None:
+    s = _settings(
+        tmp_path,
+        "VLLM_BASE_URL=https://vllm.example/v1\nVLLM_API_KEY=secret\n",
+    )
+    assert s.model_base_url == "https://vllm.example/v1"
+    assert s.model_api_key == "secret"

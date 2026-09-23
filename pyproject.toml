@@ -47,6 +47,7 @@ modal = [
 agent = [
     "langchain>=1.0",
     "langchain-openai>=1.0",
+    "tavily-python>=0.5",  # web_search tool; omitted from the agent's tools if TAVILY_API_KEY is unset
     "langgraph>=1.0",
     "nh3>=0.2.18",          # HTML sanitiser for agent-authored pages (Rust, no C deps)
     "markdown>=3.7",
@@ -57,6 +58,7 @@ agent = [
 # real Postgres driver; the API keeps supabase-py and never loads psycopg.
 pipeline = [
     "psycopg[binary]>=3.2.0",
+    "psycopg_pool>=3.2.0",
 ]
 
 [build-system]

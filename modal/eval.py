@@ -21,6 +21,9 @@ from __future__ import annotations
 import json
 import os
 import random
+import time
+import urllib.error
+import urllib.request
 from typing import Any
 
 from common import (
@@ -75,6 +78,74 @@ Reply with JSON only: {"winner": "A" | "B" | "tie", "reason": "<one sentence>"}"
 
 TEMPERATURE = 0.7
 MAX_TOKENS = 2048
+
+
+def _health_url(endpoint: str) -> str:
+    """Convert an OpenAI-compatible ``.../v1`` URL to its health URL."""
+    root = endpoint.rstrip("/")
+    return f"{root[:-3]}/health" if root.endswith("/v1") else f"{root}/health"
+
+
+def _wait_for_vllm(endpoint: str) -> None:
+    """Wait through a scale-to-zero cold start before spending eval requests.
+
+    Modal's proxy returns ``503 no upstreams available`` while the GPU
+    container is booting. The OpenAI SDK retries quickly, but all 5 attempts
+    can be exhausted before vLLM has loaded the base model and adapters. A
+    readiness loop turns that race into bounded waiting instead of a failed
+    evaluation run.
+    """
+    timeout_s = float(os.environ.get("EVAL_READY_TIMEOUT_S", "900"))
+    poll_s = float(os.environ.get("EVAL_READY_POLL_S", "15"))
+    request_timeout_s = min(float(os.environ.get("MODEL_TIMEOUT_S", "300")), 30.0)
+    health = _health_url(endpoint)
+    deadline = time.monotonic() + timeout_s
+    last_error = "unknown readiness error"
+
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(health, timeout=request_timeout_s) as response:
+                if 200 <= response.status < 300:
+                    print(f"[jeno] vLLM ready: {health}")
+                    return
+                last_error = f"HTTP {response.status}"
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = str(exc)
+        print(f"[jeno] vLLM not ready ({last_error}); retrying in {poll_s:g}s")
+        time.sleep(poll_s)
+
+    raise RuntimeError(f"vLLM did not become ready within {timeout_s:g}s: {health} ({last_error})")
+
+
+def _complete_with_retry(
+    client: Any, *, model: str, messages: list[dict[str, str]], seed: int
+) -> Any:
+    """Retry transient Modal/vLLM failures with a long cold-start backoff."""
+    from openai import APIConnectionError, APIError, APITimeoutError
+
+    attempts = int(os.environ.get("MODEL_RETRY_ATTEMPTS", "5"))
+    initial_s = float(os.environ.get("MODEL_RETRY_INITIAL_S", "10"))
+    max_s = float(os.environ.get("MODEL_RETRY_MAX_S", "60"))
+    for attempt in range(attempts):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,  # type: ignore[arg-type]
+                max_completion_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                seed=seed,
+            )
+        except (APIConnectionError, APITimeoutError, APIError) as exc:
+            status = getattr(exc, "status_code", None)
+            transient = status is None or status in {408, 409, 425, 429, 500, 502, 503, 504}
+            if not transient or attempt == attempts - 1:
+                raise
+            delay = min(initial_s * (2**attempt), max_s)
+            print(
+                f"[jeno] transient vLLM error ({status or type(exc).__name__}); retrying in {delay:g}s"
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _load_briefs(uri: str | None) -> list[dict[str, Any]]:
@@ -207,7 +278,18 @@ def evaluate(
     from app.services.llm import parse_article
 
     briefs = _load_briefs(briefs_uri)[:limit]
-    client = OpenAI(base_url=endpoint, api_key=os.environ.get("VLLM_API_KEY", "not-needed"))
+    _wait_for_vllm(endpoint)
+    client = OpenAI(
+        base_url=endpoint,
+        api_key=os.environ.get("VLLM_API_KEY", "not-needed"),
+        # Evaluation calls the same scale-to-zero server as production. Let the
+        # SDK retry transient 502/503/504 cold-start responses, but keep the
+        # per-request timeout finite so a broken endpoint still fails clearly.
+        timeout=float(os.environ.get("MODEL_TIMEOUT_S", "300")),
+        # Retries are explicit in _complete_with_retry so the cold-start wait
+        # is visible in Modal logs and does not exhaust before vLLM is ready.
+        max_retries=0,
+    )
     candidates = {"base": BASE_MODEL, "finetuned": adapter_name}
 
     results: list[dict[str, Any]] = []
@@ -216,15 +298,7 @@ def evaluate(
         generated: dict[str, tuple[str, str]] = {}
 
         for label, model in candidates.items():
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,  # type: ignore[arg-type]
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                # Fixed seed: the two candidates should differ because of the
-                # adapter, not because of sampling luck.
-                seed=index,
-            )
+            completion = _complete_with_retry(client, model=model, messages=messages, seed=index)
             raw = completion.choices[0].message.content or ""
             title, meta, body = parse_article(raw)
             generated[label] = (title, body)
@@ -272,7 +346,12 @@ def _judge(
     """Blind pairwise comparison with randomised presentation order."""
     from openai import OpenAI
 
-    client = OpenAI(base_url=endpoint, api_key=api_key)
+    client = OpenAI(
+        base_url=endpoint,
+        api_key=api_key,
+        timeout=float(os.environ.get("MODEL_TIMEOUT_S", "300")),
+        max_retries=int(os.environ.get("MODEL_RETRY_ATTEMPTS", "5")),
+    )
     flipped = random.Random(seed).random() < 0.5
     first, second = (output_b, output_a) if flipped else (output_a, output_b)
 
@@ -285,8 +364,7 @@ def _judge(
                 "content": f"BRIEF:\n{brief}\n\n=== ARTICLE A ===\n{first}\n\n=== ARTICLE B ===\n{second}",
             },
         ],
-        temperature=0.0,
-        max_tokens=200,
+        max_completion_tokens=200,
     )
     try:
         raw = completion.choices[0].message.content or "{}"

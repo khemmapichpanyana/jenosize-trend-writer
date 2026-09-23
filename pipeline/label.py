@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from typing import Any
 
 import typer
 from openai import AsyncOpenAI
@@ -132,16 +133,30 @@ def build_labels(payload: dict, article: TrainingArticle) -> ArticleLabels:
 
 async def label_one(client: AsyncOpenAI, model: str, article: TrainingArticle) -> ArticleLabels:
     body = (article.clean_markdown or "")[:MAX_ARTICLE_CHARS]
-    completion = await client.chat.completions.create(
-        model=model,
-        messages=[
+    modern_openai_model = model.lower().startswith(("gpt-5", "o1", "o3", "o4"))
+    # OpenAI's GPT-5/o-series endpoints renamed this request field. Keep
+    # `max_tokens` for vLLM and older OpenAI-compatible labelers.
+    token_limit = {"max_completion_tokens": 400} if modern_openai_model else {"max_tokens": 400}
+    # The OpenAI client exposes different keyword overloads for legacy
+    # `max_tokens` and newer `max_completion_tokens`. Keeping this small
+    # request envelope dynamic lets the same labeller work with both OpenAI
+    # and OpenAI-compatible vLLM endpoints without weakening the runtime
+    # validation above.
+    request: Any = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": LABELER_SYSTEM},
             {"role": "user", "content": f"Title: {article.title or ''}\n\n{body}"},
         ],
-        # Labels should be reproducible: same article in, same brief out.
-        temperature=0.0,
-        max_tokens=400,
-        response_format={"type": "json_object"},
+        "response_format": {"type": "json_object"},
+        **token_limit,
+    }
+    # GPT-5/o-series endpoints only accept their default temperature (1). Older
+    # compatible endpoints still use zero for reproducible reverse-labels.
+    if not modern_openai_model:
+        request["temperature"] = 0.0
+    completion = await client.chat.completions.create(
+        **request,
     )
     return build_labels(parse_label_json(completion.choices[0].message.content or ""), article)
 
